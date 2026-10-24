@@ -221,6 +221,32 @@ var tuiRun = tui.Run
 // Windows, half a second for each one another program holds open).
 func syncAgentsOnChange() { catalog.Changed = agent.SyncCatalogSoon }
 
+// startUp brings the files magpie and its agents keep up to what this
+// magpie reads, before a command that may read them; a var so a test can
+// tell it ran.
+var startUp = func() {
+	// started by an update, the magpie it replaces goes first: the moves
+	// below write the files it may still be writing
+	update.AwaitPredecessor()
+	makeDirs()
+	settings.Migrate()
+	// every built-in plugin starts on (plugins.yml), on a new install too
+	if _, err := pluginrt.Settle(); err != nil {
+		fmt.Fprintf(os.Stderr, "magpie: plugins.yml: %v\n", err)
+	}
+	if _, err := pluginrt.Refresh(); err != nil {
+		fmt.Fprintf(os.Stderr, "magpie: plugins.yml: %v\n", err)
+	}
+	// the providers and settings read once for every agent's fields, which
+	// the moves below look at (a write among them reads them again)
+	release := provider.Hold()
+	agent.RenameLegacy()
+	agent.MoveCursorEfforts()
+	agent.MoveAntigravityEfforts()
+	agent.MoveOffAccountIDs()
+	release()
+}
+
 func run(args []string) error {
 	// a command that saved a provider or a group ends with the agents'
 	// files written, which its save no longer waits for; and a test's run
@@ -260,26 +286,22 @@ func run(args []string) error {
 	if len(args) > 1 && (args[0] == "accounts" || args[0] == "account") && args[1] == "discovery" {
 		return accountsDiscoveryCmd(args[2:])
 	}
-	// started by an update, the magpie it replaces goes first: the moves
-	// below write the files it may still be writing
-	update.AwaitPredecessor()
-	makeDirs()
-	settings.Migrate()
-	// every built-in plugin starts on (plugins.yml), on a new install too
-	if _, err := pluginrt.Settle(); err != nil {
-		fmt.Fprintf(os.Stderr, "magpie: plugins.yml: %v\n", err)
+	// what an agent starts for each session or message talks to the
+	// running gateway and nothing else: the moves below list every
+	// provider and account, which starts the plugin host and asks claude,
+	// cursor-agent and devin who is signed in — five processes and a
+	// Claude /usage for each Claude Code session's image MCP (#3318)
+	if len(args) > 0 {
+		switch args[0] {
+		case "mcp":
+			return imagemcp.Run(args[1:])
+		case "claude-mcp-helper": // internal: stdio MCP subprocess spawned by Claude Code
+			return claudebridge.RunMCP(args[1:])
+		case "statusline":
+			return statuslineCmd(args)
+		}
 	}
-	if _, err := pluginrt.Refresh(); err != nil {
-		fmt.Fprintf(os.Stderr, "magpie: plugins.yml: %v\n", err)
-	}
-	// the providers and settings read once for every agent's fields, which
-	// the moves below look at (a write among them reads them again)
-	release := provider.Hold()
-	agent.RenameLegacy()
-	agent.MoveCursorEfforts()
-	agent.MoveAntigravityEfforts()
-	agent.MoveOffAccountIDs()
-	release()
+	startUp()
 	// a provider added, edited or removed, or a list fetched anew, reaches
 	// the model lists agents keep in files of their own, behind the save
 	// that changed it (agent.SyncCatalogSoon)
@@ -419,8 +441,6 @@ func run(args []string) error {
 		return sessionsCmd(args)
 	case "quota", "quotas":
 		return quotaCmd(args)
-	case "statusline":
-		return statuslineCmd(args)
 	case "update":
 		return updateCmd(args)
 	case "library", "lib":
@@ -437,12 +457,8 @@ func run(args []string) error {
 		return s3Cmd(args[1:])
 	case "github":
 		return githubCmd(args[1:])
-	case "mcp":
-		return imagemcp.Run(args[1:])
 	case "claude-code":
 		return claudeCodeCmd(args[1:])
-	case "claude-mcp-helper": // internal: stdio MCP subprocess spawned by Claude Code
-		return claudebridge.RunMCP(args[1:])
 	}
 
 	a, err := agent.Find(args[0])
