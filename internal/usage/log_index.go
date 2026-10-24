@@ -272,7 +272,9 @@ func (c *rowChunk) freeze() *rowChunk {
 		c.Bytes -= int64(32 * len(c.Strings))
 	}
 	c.shapeIDs = nil
-	return c.pack()
+	c = c.pack()
+	c.serial = nextChunkSerial()
+	return c
 }
 
 func resumeLogHash(h hash.Hash, state []byte) bool {
