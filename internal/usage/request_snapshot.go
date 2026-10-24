@@ -91,6 +91,7 @@ func (c *rowChunk) pack() *rowChunk {
 		return c
 	}
 	next := *c
+	next.Count = len(c.Rows) // what rowsIn says of it
 	next.Rows, next.Strings, next.Shapes, next.dict, next.shapeIDs = nil, nil, nil, nil, nil
 	next.Archive, next.Locations = slices.Clone(encoded), locations
 	next.Bytes = int64(len(next.Archive)+len(locations)*8) + codexActorBytes(next.codexActors)

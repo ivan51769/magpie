@@ -14,6 +14,7 @@ import (
 	"maps"
 	"os"
 	"path/filepath"
+	"reflect"
 	"slices"
 	"sort"
 	"strings"
@@ -345,11 +346,24 @@ type rowRef struct {
 	Index int
 }
 
-func (r rowRef) row() Row      { return r.Chunk.row(r.Index) }
-func (r rowRef) at() time.Time { return r.Chunk.Rows[r.Index].Time }
+func (r rowRef) row() Row { return r.Chunk.row(r.Index) }
 func refNewer(a, b rowRef) bool {
-	if !a.at().Equal(b.at()) {
-		return a.at().After(b.at())
+	return timedOf(a, &a.Chunk.Rows[a.Index]).newer(timedOf(b, &b.Chunk.Rows[b.Index]))
+}
+
+// timedRef is a ref with what puts it in order, newest first: its row's
+// time and order. A packed chunk's refs are put in order without its rows.
+type timedRef struct {
+	rowRef
+	at    time.Time
+	order int64
+}
+
+func timedOf(ref rowRef, p *packedRow) timedRef { return timedRef{ref, p.Time, p.Order} }
+
+func (a timedRef) newer(b timedRef) bool {
+	if !a.at.Equal(b.at) {
+		return a.at.After(b.at)
 	}
 	if (a.Chunk.Source.Path == "") != (b.Chunk.Source.Path == "") {
 		return a.Chunk.Source.Path == ""
@@ -357,16 +371,85 @@ func refNewer(a, b rowRef) bool {
 	if a.Chunk.Source.Path != b.Chunk.Source.Path {
 		return a.Chunk.Source.Path > b.Chunk.Source.Path
 	}
-	return a.Chunk.Rows[a.Index].Order > b.Chunk.Rows[b.Index].Order
+	return a.order > b.order
 }
 
-type newestHeap []rowRef
+type newestHeap []timedRef
 
 func (h newestHeap) Len() int           { return len(h) }
-func (h newestHeap) Less(i, j int) bool { return refNewer(h[j], h[i]) }
+func (h newestHeap) Less(i, j int) bool { return h[j].newer(h[i]) }
 func (h newestHeap) Swap(i, j int)      { h[i], h[j] = h[j], h[i] }
-func (h *newestHeap) Push(v any)        { *h = append(*h, v.(rowRef)) }
+func (h *newestHeap) Push(v any)        { *h = append(*h, v.(timedRef)) }
 func (h *newestHeap) Pop() any          { a := *h; v := a[len(a)-1]; *h = a[:len(a)-1]; return v }
+
+// rowsIn is how many rows c has, packed or not.
+func rowsIn(c *rowChunk) int {
+	if len(c.Archive) != 0 {
+		return c.Count
+	}
+	return len(c.Rows)
+}
+
+// chunkRows reads chunks' rows one chunk at a time. A page of the whole
+// history held every session file's rows decoded at once, beside the
+// packed copies it keeps: ~100 MB of a start that peaked at 508 MB over
+// 420k calls. A packed chunk is decoded when a pass reaches it, into a
+// buffer the next one's decode reuses, and refs still name the packed
+// chunk.
+type chunkRows struct {
+	c, open *rowChunk
+	buf     []packedRow
+}
+
+// of is c's rows to read. What the page set on c since (a Codex actor or
+// compaction, the identities) is read through c.
+func (r *chunkRows) of(c *rowChunk) *rowChunk {
+	if len(c.Archive) == 0 {
+		return c
+	}
+	if r.c != c {
+		open := c.unpackInto(r.buf)
+		if open == nil { // never written so: pack wrote it in this process
+			open = &rowChunk{Source: c.Source, Computer: c.Computer}
+		}
+		if cap(open.Rows) > cap(r.buf) {
+			r.buf = open.Rows[:0]
+		}
+		r.c, r.open = c, open
+	}
+	r.open.codexActors, r.open.codexCompactions, r.open.codexIdentities = c.codexActors, c.codexCompactions, c.codexIdentities
+	return r.open
+}
+
+func (r *chunkRows) row(ref rowRef) Row { return r.of(ref.Chunk).row(ref.Index) }
+
+// rowsOf reads the rows refs name, each chunk once, in the order of chunks.
+func rowsOf(chunks []*rowChunk, refs []rowRef) map[rowRef]Row {
+	out := make(map[rowRef]Row, len(refs))
+	byChunk := map[*rowChunk][]int{}
+	for _, ref := range refs {
+		byChunk[ref.Chunk] = append(byChunk[ref.Chunk], ref.Index)
+	}
+	var rows chunkRows
+	for _, c := range chunks {
+		indexes, ok := byChunk[c]
+		if !ok {
+			continue
+		}
+		delete(byChunk, c)
+		open := rows.of(c)
+		for _, i := range indexes {
+			out[rowRef{c, i}] = open.row(i)
+		}
+	}
+	for c, indexes := range byChunk { // a ref to a chunk not in chunks
+		open := rows.of(c)
+		for _, i := range indexes {
+			out[rowRef{c, i}] = open.row(i)
+		}
+	}
+	return out
+}
 
 type pageKey struct {
 	Period        Period
@@ -639,10 +722,10 @@ func queryPage(p Period, f Filter, offset, limit int, readSource func(sessions.C
 		if !since.IsZero() && s.Modified.Before(since) {
 			continue
 		}
-		cached := idx.chunks[s.Path]
-		c := cached.unpack()
-		reused := c != nil && c.Source.Size == s.Size && c.Source.Modified.Equal(s.Modified)
-		if !reused {
+		// kept packed: the page reads a chunk's rows when it reaches them
+		// (chunkRows), not every file's at once
+		c := idx.chunks[s.Path]
+		if reused := c != nil && c.Source.Size == s.Size && c.Source.Modified.Equal(s.Modified); !reused {
 			if resolver == nil {
 				resolver = newSessionResolver([]sessions.Call{{}})
 			}
@@ -659,19 +742,12 @@ func queryPage(p Period, f Filter, offset, limit int, readSource func(sessions.C
 			}
 			c.Bytes -= int64(32 * len(c.Strings))
 			c.dict, c.shapeIDs = nil, nil // local chunks are immutable until the source changes
-			idx.chunks[s.Path] = c
+			c = c.pack()
 		}
-		next := *c
-		c = &next
-		c.Used = idx.tick
-		if reused {
-			kept := *cached
-			kept.Used = idx.tick
-			idx.chunks[s.Path] = &kept
-		} else {
-			idx.chunks[s.Path] = c.pack()
-		}
-		chunks = append(chunks, c)
+		kept, next := *c, *c
+		kept.Used, next.Used = idx.tick, idx.tick
+		idx.chunks[s.Path] = &kept
+		chunks = append(chunks, &next)
 	}
 	// the other computers' days (#542), a chunk each, read again only when
 	// sync brought a new copy
@@ -686,10 +762,8 @@ func queryPage(p Period, f Filter, offset, limit int, readSource func(sessions.C
 		if s.day < from {
 			continue
 		}
-		cached := idx.chunks[s.path]
-		c := cached.unpack()
-		reused := c != nil && c.Source.Size == s.size && c.Source.Modified.Equal(s.mod)
-		if !reused {
+		c := idx.chunks[s.path]
+		if reused := c != nil && c.Source.Size == s.size && c.Source.Modified.Equal(s.mod); !reused {
 			d, _ := readShared(s.path)
 			if renames == nil {
 				renames = provider.Renamed()
@@ -705,18 +779,12 @@ func queryPage(p Period, f Filter, offset, limit int, readSource func(sessions.C
 			}
 			c.Bytes -= int64(32 * len(c.Strings))
 			c.dict, c.shapeIDs = nil, nil
+			c = c.pack()
 		}
-		next := *c
-		c = &next
-		c.Used = idx.tick
-		if reused {
-			kept := *cached
-			kept.Used = idx.tick
-			idx.chunks[s.path] = &kept
-		} else {
-			idx.chunks[s.path] = c.pack()
-		}
-		others = append(others, c)
+		kept, next := *c, *c
+		kept.Used, next.Used = idx.tick, idx.tick
+		idx.chunks[s.path] = &kept
+		others = append(others, &next)
 	}
 	for path := range idx.chunks {
 		if !on[path] {
@@ -794,17 +862,20 @@ func queryPage(p Period, f Filter, offset, limit int, readSource func(sessions.C
 func visibleLocal(chunks []*rowChunk) map[rowRef]bool {
 	duplicates := map[rowRef]bool{}
 	seen := map[string]bool{}
+	var rows chunkRows
 	for _, c := range chunks {
-		for i := range c.Rows {
-			p := &c.Rows[i]
-			msg := c.Strings[c.text(p, rowMsg)]
+		open := rows.of(c)
+		for i := range open.Rows {
+			p := &open.Rows[i]
+			msg := open.Strings[open.text(p, rowMsg)]
 			if msg == "" {
 				continue
 			}
 			if seen[msg] {
 				duplicates[rowRef{c, i}] = true
 			} else {
-				seen[msg] = true
+				// a copy: a decoded chunk's strings are one allocation
+				seen[strings.Clone(msg)] = true
 			}
 		}
 	}
@@ -882,27 +953,32 @@ func matchedBlocks(gateways []*rowChunk, chunks []*rowChunk, skip map[rowRef]boo
 			}
 		}
 	}
-	byRequest := map[string][]rowRef{}
+	byRequest := map[string][]timedRef{}
+	var rows chunkRows
 	for _, c := range chunks {
-		for i := range c.Rows {
-			p := &c.Rows[i]
+		open := rows.of(c)
+		for i := range open.Rows {
+			p := &open.Rows[i]
 			ref := rowRef{c, i}
 			if skip[ref] || reserved[ref] || p.Time.Before(since) {
 				continue
 			}
-			if id := c.Strings[c.text(p, 11)]; len(byID[id]) > 0 {
-				byRequest[id] = append(byRequest[id], ref)
+			if id := open.Strings[open.text(p, 11)]; len(byID[id]) > 0 {
+				if _, ok := byRequest[id]; !ok {
+					id = strings.Clone(id)
+				}
+				byRequest[id] = append(byRequest[id], timedOf(ref, p))
 			}
 		}
 	}
 	used := map[rowRef]bool{}
 	for id, refs := range byRequest {
 		if newestIDs {
-			slices.SortFunc(refs, func(a, b rowRef) int {
-				if refNewer(a, b) {
+			slices.SortFunc(refs, func(a, b timedRef) int {
+				if a.newer(b) {
 					return -1
 				}
-				if refNewer(b, a) {
+				if b.newer(a) {
 					return 1
 				}
 				return 0
@@ -912,7 +988,7 @@ func matchedBlocks(gateways []*rowChunk, chunks []*rowChunk, skip map[rowRef]boo
 			if j >= len(byID[id]) {
 				break
 			}
-			matched[ref], used[byID[id][j]] = true, true
+			matched[ref.rowRef], used[byID[id][j]] = true, true
 		}
 	}
 	groups := map[matchKey]*matchGroup{}
@@ -950,10 +1026,11 @@ func matchedBlocks(gateways []*rowChunk, chunks []*rowChunk, skip map[rowRef]boo
 		g.counts = make([]int, len(g.ends)+1)
 	}
 	candidates := map[rowRef]rowRef{}
-	for _, c := range chunks {
+	for _, chunk := range chunks {
+		c := rows.of(chunk)
 		for j := range c.Rows {
 			p := &c.Rows[j]
-			ref := rowRef{c, j}
+			ref := rowRef{chunk, j}
 			if skip[ref] || reserved[ref] || matched[ref] || p.Time.Before(since) {
 				continue
 			}
@@ -1038,10 +1115,58 @@ func buildRequestBlocks(p Period, f Filter, offset, limit int, now time.Time, ga
 	return buildRequestBlocksWithCodex(p, f, offset, limit, now, gateways, chunks, others, names, sessions.CodexIdentities())
 }
 
+// buildRequestBlocksWithCodex's page owns its strings. A packed chunk is
+// read through one block of strings at a time (chunkRows), and a row, an
+// agent's name or a group kept by the page from it would hold that whole
+// block: ~9 MB after the first page, kept by the request cache.
 func buildRequestBlocksWithCodex(p Period, f Filter, offset, limit int, now time.Time, gateways, chunks, others []*rowChunk, names map[string]string, identities map[string]sessions.CodexIdentity) RequestPage {
+	out := buildRequestBlocksOf(p, f, offset, limit, now, gateways, chunks, others, names, identities)
+	ownStrings(reflect.ValueOf(&out).Elem())
+	return out
+}
+
+// ownStrings copies every string v holds that can be set, map keys too.
+func ownStrings(v reflect.Value) {
+	switch v.Kind() {
+	case reflect.String:
+		if v.CanSet() && v.Len() > 0 {
+			v.SetString(strings.Clone(v.String()))
+		}
+	case reflect.Pointer:
+		if !v.IsNil() {
+			ownStrings(v.Elem())
+		}
+	case reflect.Struct:
+		for i := range v.NumField() {
+			if f := v.Field(i); f.CanSet() {
+				ownStrings(f)
+			}
+		}
+	case reflect.Slice, reflect.Array:
+		for i := range v.Len() {
+			ownStrings(v.Index(i))
+		}
+	case reflect.Map:
+		if v.IsNil() || !v.CanSet() {
+			return
+		}
+		m := reflect.MakeMapWithSize(v.Type(), v.Len())
+		for it := v.MapRange(); it.Next(); {
+			k, e := reflect.New(v.Type().Key()).Elem(), reflect.New(v.Type().Elem()).Elem()
+			k.Set(it.Key())
+			e.Set(it.Value())
+			ownStrings(k)
+			ownStrings(e)
+			m.SetMapIndex(k, e)
+		}
+		v.Set(m)
+	}
+}
+
+func buildRequestBlocksOf(p Period, f Filter, offset, limit int, now time.Time, gateways, chunks, others []*rowChunk, names map[string]string, identities map[string]sessions.CodexIdentity) RequestPage {
 	gateways, chunks, others = cloneCodexChunks(gateways), cloneCodexChunks(chunks), cloneCodexChunks(others)
 	duplicateSkip := foldCodexRows(chunks)
-	pairs := codexChunkResponsePairs(gateways, chunks, duplicateSkip)
+	pairs, compactions := codexChunkResponsePairs(gateways, chunks, duplicateSkip)
 	for _, set := range [][]*rowChunk{gateways, chunks, others} {
 		for _, chunk := range set {
 			chunk.codexIdentities = identities
@@ -1059,18 +1184,20 @@ func buildRequestBlocksWithCodex(p Period, f Filter, offset, limit int, now time
 			actor = local.Chunk.codexActors[local.Index]
 		}
 		setCodexActor(gateway.Chunk, gateway.Index, actor)
-		gateway.Chunk.setCodexCompaction(gateway.Index, local.row().Compaction)
+		gateway.Chunk.setCodexCompaction(gateway.Index, compactions[local])
 	}
 	all := append(append(slices.Clone(gateways), chunks...), others...)
-	visit := func(fn func(rowRef, Row)) {
+	visit := func(fn func(timedRef, Row)) {
+		var rows chunkRows
 		for _, c := range all {
-			for i := range c.Rows {
-				pr := &c.Rows[i] // not a copy: a row is 216 bytes
+			open := rows.of(c)
+			for i := range open.Rows {
+				pr := &open.Rows[i] // not a copy: a row is 216 bytes
 				ref := rowRef{c, i}
 				if pr.Time.Before(since) || after(until, pr.Time) || len(skip) > 0 && skip[ref] || len(matched) > 0 && matched[ref] {
 					continue
 				}
-				fn(ref, c.row(i))
+				fn(timedOf(ref, pr), open.row(i))
 			}
 		}
 	}
@@ -1081,7 +1208,7 @@ func buildRequestBlocksWithCodex(p Period, f Filter, offset, limit int, now time
 	// year the groups, shares and series below took seconds a call (#3493).
 	if p == heatmapPeriod {
 		out.Heat = heatmapOf(since, now, func(add func(Row)) {
-			visit(func(_ rowRef, r Row) {
+			visit(func(_ timedRef, r Row) {
 				if chartFilter.keepsRow(r) {
 					add(r)
 				}
@@ -1107,7 +1234,7 @@ func buildRequestBlocksWithCodex(p Period, f Filter, offset, limit int, now time
 	// reach MaxInt, and a page beyond all sources needs no heap at all.
 	maxRows := 0
 	for _, c := range all {
-		maxRows += len(c.Rows)
+		maxRows += rowsIn(c)
 	}
 	take := 0
 	if offset < maxRows {
@@ -1121,7 +1248,7 @@ func buildRequestBlocksWithCodex(p Period, f Filter, offset, limit int, now time
 	// the rows the chart counts, kept as the first pass
 	// finds them so that theirs needn't read every row of the period again
 	var charted []rowRef
-	visit(func(ref rowRef, r Row) {
+	visit(func(ref timedRef, r Row) {
 		// looked up before they are set: most rows name what an earlier
 		// one did, and a map's lookup is cheaper than its write
 		if !agents[r.Agent] {
@@ -1140,7 +1267,7 @@ func buildRequestBlocksWithCodex(p Period, f Filter, offset, limit int, now time
 			out.Total++
 			if take > 0 && len(selected) < take {
 				heap.Push(&selected, ref)
-			} else if take > 0 && refNewer(ref, selected[0]) {
+			} else if take > 0 && ref.newer(selected[0]) {
 				selected[0] = ref
 				heap.Fix(&selected, 0)
 			}
@@ -1167,7 +1294,7 @@ func buildRequestBlocksWithCodex(p Period, f Filter, offset, limit int, now time
 			return
 		}
 		if keep || f.Day != "" && chartFilter.keepsRow(r) {
-			charted = append(charted, ref)
+			charted = append(charted, ref.rowRef)
 			for _, d := range Dimensions {
 				k := keys.key(r, d)
 				s := seriesGroups[d][k]
@@ -1217,17 +1344,22 @@ func buildRequestBlocksWithCodex(p Period, f Filter, offset, limit int, now time
 			s.addRow(r)
 		}
 	})
-	slices.SortFunc(selected, func(a, b rowRef) int {
-		if refNewer(a, b) {
+	slices.SortFunc(selected, func(a, b timedRef) int {
+		if a.newer(b) {
 			return -1
 		}
-		if refNewer(b, a) {
+		if b.newer(a) {
 			return 1
 		}
 		return 0
 	})
+	var page []rowRef
 	for _, ref := range selected[min(offset, len(selected)):] {
-		out.Rows = append(out.Rows, ref.row())
+		page = append(page, ref.rowRef)
+	}
+	read := rowsOf(all, page)
+	for _, ref := range page {
+		out.Rows = append(out.Rows, read[ref])
 	}
 	for a := range agents {
 		out.Agents = append(out.Agents, a)
@@ -1267,8 +1399,9 @@ func buildRequestBlocksWithCodex(p Period, f Filter, offset, limit int, now time
 			out.Series[i].By[d] = map[string]Part{}
 		}
 	}
+	var chartRows chunkRows // charted is in the order of all: each chunk is read once
 	for _, ref := range charted {
-		r := ref.row()
+		r := chartRows.row(ref)
 		t := r.Time.In(now.Location())
 		if t.Before(chartSince) {
 			continue

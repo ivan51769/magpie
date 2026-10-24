@@ -31,6 +31,7 @@ import (
 
 	"github.com/yetone/magpie/internal/access"
 	"github.com/yetone/magpie/internal/awake"
+	"github.com/yetone/magpie/internal/catalog"
 	"github.com/yetone/magpie/internal/gwbudget"
 	"github.com/yetone/magpie/internal/gwmw"
 	"github.com/yetone/magpie/internal/gwtool"
@@ -953,6 +954,56 @@ func modelObject(e provider.Entry) map[string]any {
 	return m
 }
 
+// pricedModelObject is modelObject with the model's pricing, as the list
+// gives it, for the callers the list tells it to.
+func pricedModelObject(r *http.Request, e provider.Entry) map[string]any {
+	m := modelObject(e)
+	if local(r) || sharedWith(r) {
+		if pr, ok := provider.EntryPriceIn(settings.Load(), provider.GroupFinder(), e); ok {
+			m["pricing"] = openRouterPricing(pr)
+		}
+	}
+	return m
+}
+
+// openRouterPricing is a price as OpenRouter's model list writes it, the
+// shape agents and SDKs built on that list read: USD a token, as decimal
+// strings. prompt and completion are always there, a price set at 0
+// included, since the price is known; a cache read or write only when it
+// has a price, as a part a list leaves at 0 is one it doesn't give. The
+// base price only: a model billed more above a prompt size (Tiers) tells
+// what it costs below it, and the 1-hour cache write has no field there.
+func openRouterPricing(pr catalog.Price) map[string]string {
+	out := map[string]string{"prompt": perToken(pr.Input), "completion": perToken(pr.Output)}
+	if pr.CacheRead > 0 {
+		out["input_cache_read"] = perToken(pr.CacheRead)
+	}
+	if pr.CacheWrite > 0 {
+		out["input_cache_write"] = perToken(pr.CacheWrite)
+	}
+	return out
+}
+
+// perToken is a price of USD a million tokens as USD a token, written as
+// a decimal: the decimal point moved, not the float divided, so $0.3 is
+// "0.0000003" and not 2.9999999999999997e-07.
+func perToken(perMillion float64) string {
+	s := strconv.FormatFloat(max(perMillion, 0), 'f', -1, 64)
+	whole, frac, _ := strings.Cut(s, ".")
+	if len(whole) < 7 {
+		whole = strings.Repeat("0", 7-len(whole)) + whole
+	}
+	cut := len(whole) - 6
+	whole, frac = strings.TrimLeft(whole[:cut], "0"), strings.TrimRight(whole[cut:]+frac, "0")
+	if whole == "" {
+		whole = "0"
+	}
+	if frac == "" {
+		return whole
+	}
+	return whole + "." + frac
+}
+
 // cursorLocalModel adds what Cursor Private Inference reads of a model
 // (#299): api_types, the APIs it may ask it on — those the model is relayed
 // on as it is, so a Claude served on Anthropic Messages is asked there and
@@ -1095,11 +1146,18 @@ func (s *Server) models(w http.ResponseWriter, r *http.Request) {
 		// there is counted at the same price: told only to this computer
 		// and to one this magpie is shared with by a gateway key, as the
 		// prices are the user's own settings
-		var st settings.Settings
-		var find func(string) (provider.Group, []provider.Member, bool)
-		prices := r.Header.Get(provider.PricesHeader) != "" && (local(r) || sharedWith(r))
-		if prices {
-			st, find = settings.Load(), provider.GroupFinder()
+		//
+		// and to any client, OpenRouter's pricing for each model it knows
+		// a price of (cleary5779 on Discord: an agent built on magpie
+		// shows what a call costs), told to the same callers: the price is
+		// what the Usage page counts the model at, the user's own included.
+		// The settings, groups and providers are read once for the list
+		// (EntryPricer), not once a model
+		told := local(r) || sharedWith(r)
+		prices := told && r.Header.Get(provider.PricesHeader) != ""
+		var priceOf func(provider.Entry) (catalog.Price, bool)
+		if told {
+			priceOf = provider.EntryPricer(settings.Load(), provider.GroupFinder())
 		}
 		// the tiers Codex here is offered on each model (#1234), for every
 		// client: another magpie offers them to its own Codex, and Cindy
@@ -1133,9 +1191,12 @@ func (s *Server) models(w http.ResponseWriter, r *http.Request) {
 			if ts := tiers[e.ID]; len(ts) > 0 {
 				m["service_tiers"] = ts
 			}
-			if prices {
-				if pr, ok := provider.EntryPriceIn(st, find, e); ok {
-					m["magpie_price"] = pr
+			if told {
+				if pr, ok := priceOf(e); ok {
+					m["pricing"] = openRouterPricing(pr)
+					if prices {
+						m["magpie_price"] = pr
+					}
 				}
 			}
 			// for another magpie: its name as the agents' lists here call
@@ -1202,14 +1263,14 @@ func (s *Server) model(w http.ResponseWriter, r *http.Request) {
 				writeJSON(w, 200, scienceObject(e, provider.Labels([]provider.Entry{e})[0]))
 				return
 			}
-			writeJSON(w, 200, modelObject(e))
+			writeJSON(w, 200, pricedModelObject(r, e))
 			return
 		}
 	}
 	// by its bare id, as the list gives it with that setting on
 	if provider.BareModelIDs() {
 		if e, ok := provider.BareEntry(shown, id); ok {
-			writeJSON(w, 200, modelObject(e))
+			writeJSON(w, 200, pricedModelObject(r, e))
 			return
 		}
 	}
@@ -4120,7 +4181,12 @@ func (s *Server) forwardOnce(ctx context.Context, p provider.Provider, to provid
 		// magpie never does. A test asked as Codex asks with them
 		// (provider.TestAs)
 		seen := http.Header{}
+		lite := liteKept(p, to, true)
 		for k, vs := range in {
+			if !lite && strings.EqualFold(k, liteHeader) {
+				// the body left Lite (fromLite), so does its header
+				continue
+			}
 			if codexClientHeader(k) {
 				req.Header[k] = slices.Clone(vs)
 				seen[k] = vs
@@ -4297,10 +4363,11 @@ func (s *Server) passthrough(w http.ResponseWriter, r *http.Request, p provider.
 			// for other backends (#1758)
 			break
 		}
-		// Responses Lite's tools, as an input item, go as OpenAI takes them
-		// only to OpenAI (#350)
-		if (p.Account == nil || p.Account.Agent != "codex") && !strings.HasSuffix(p.Host(), "openai.com") {
-			body = liftAdditionalTools(body)
+		// Responses Lite's shape, its tools as an input item (#350) and its
+		// reasoning context, goes only to OpenAI; anyone else is sent what
+		// Codex sends a model that isn't Lite
+		if !liteKept(p, proto, fromCodex(r.Header)) {
+			body = fromLite(body)
 		}
 		// only the ChatGPT backend runs Codex's tool search as Codex sends it
 		if p.Account == nil || p.Account.Agent != "codex" {
