@@ -482,6 +482,9 @@ type requestIndex struct {
 	// names a call changes (meta), and read without the lock, since a
 	// part is never written once made
 	parts map[partKey]map[uint64]*chunkPart
+	// pairs are the last pairing of each of a few periods (pairMemo),
+	// kept as parts are
+	pairs map[Period]*pairMemo
 }
 
 // heatPage is a heatmap's page, of the gateway log's snapshot version,
@@ -669,7 +672,7 @@ func queryPage(p Period, f Filter, offset, limit int, readSource func(sessions.C
 	var cache *partCache
 	pk := partKey{p: p, f: f, since: p.Since(now), until: p.Until(now), loc: now.Location()}
 	if p.Last() == 0 && p != heatmapPeriod {
-		cache = &partCache{old: idx.parts[pk], next: map[uint64]*chunkPart{}}
+		cache = &partCache{old: idx.parts[pk], next: map[uint64]*chunkPart{}, pairs: idx.pairs[p]}
 	}
 	shared := idx
 	idx = shared.private()
@@ -695,6 +698,14 @@ func queryPage(p Period, f Filter, offset, limit int, readSource func(sessions.C
 			shared.parts = map[partKey]map[uint64]*chunkPart{}
 		}
 		shared.parts[pk] = cache.next
+		if shared.pairs == nil || len(shared.pairs) >= partSets && shared.pairs[p] == nil {
+			shared.pairs = map[Period]*pairMemo{}
+		}
+		if cache.pairsNext != nil {
+			shared.pairs[p] = cache.pairsNext
+		} else {
+			delete(shared.pairs, p)
+		}
 	}
 	if len(shared.pages) >= 16 {
 		shared.pages = map[pageKey]RequestPage{}
@@ -894,6 +905,7 @@ func (idx *requestIndex) adopt(st requestState) {
 		idx.pages = nil
 		idx.heats = nil
 		idx.parts = nil
+		idx.pairs = nil
 		idx.key = ""
 	}
 	if idx.key != st.key {
@@ -1361,7 +1373,12 @@ func buildRequestBlocksOf(p Period, f Filter, offset, limit int, now time.Time, 
 // cache's for the chunks it has them for (nil: every chunk's read).
 func buildRequestBlocksIn(p Period, f Filter, offset, limit int, now time.Time, gateways, chunks, others []*rowChunk, names map[string]string, identities map[string]sessions.CodexIdentity, cache *partCache) RequestPage {
 	since := p.Since(now)
-	ps := pairRows(p, now, gateways, chunks, others, identities)
+	var ps *pairedRows
+	if cache != nil {
+		ps, cache.pairsNext = pairRowsMemo(p, now, gateways, chunks, others, identities, cache.pairs)
+	} else {
+		ps = pairRows(p, now, gateways, chunks, others, identities)
+	}
 	out := RequestPage{Rows: []Row{}, Agents: []string{}, Providers: []string{}, Purposes: []string{}, By: map[string][]Share{}}
 	chartFilter := f
 	chartFilter.Day = ""

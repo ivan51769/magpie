@@ -101,6 +101,8 @@ type partKey struct {
 // the index keeps for the next.
 type partCache struct {
 	old, next map[uint64]*chunkPart
+	// pairs is the last pairing of the period, and pairsNext this page's
+	pairs, pairsNext *pairMemo
 }
 
 // partSets bounds the partKeys kept: a page is open on one period and
