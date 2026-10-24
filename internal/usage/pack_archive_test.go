@@ -2,6 +2,7 @@ package usage
 
 import (
 	"fmt"
+	"reflect"
 	"runtime"
 	"testing"
 	"time"
@@ -77,5 +78,37 @@ func TestFewRowsArePacked(t *testing.T) {
 	back := packed.unpack()
 	if back == nil || len(back.Rows) != 3 || back.row(2).Input != 1202 || back.row(2).Model != "gpt-5.5" {
 		t.Fatal("3 rows: not read back")
+	}
+}
+
+// Blocks read one after another through one chunkRows reuse its rows',
+// strings' and shapes' buffers, a large block's and then a small one's, and
+// each reads back as it was packed: a row's text is the block's own, never
+// a string or shape the block before left in the buffer.
+func TestChunkRowsReuseReadsEachBlock(t *testing.T) {
+	now := time.Now().Round(0)
+	block := func(k, n int) (*rowChunk, *rowChunk) {
+		c := &rowChunk{}
+		for i := range n {
+			r := Row{Record: Record{Time: now.Add(time.Duration(i) * time.Second), Agent: fmt.Sprint("agent", k, "-", i%3), Provider: "p", Model: fmt.Sprint("m", k, "-", i%5), Input: k*1000 + i, Session: fmt.Sprint("s", k, "-", i)}}
+			c.add(r, fmt.Sprint("msg", k, "-", i), int64(i), i%4 == 0)
+		}
+		return c, c.pack()
+	}
+	var rows chunkRows
+	for k, n := range []int{400, 3, 120, 1, 400} {
+		plain, packed := block(k, n)
+		open := rows.of(packed)
+		if len(open.Rows) != n {
+			t.Fatalf("block %d: %d rows, want %d", k, len(open.Rows), n)
+		}
+		for i := range n {
+			if got, want := open.row(i), plain.row(i); !reflect.DeepEqual(got, want) {
+				t.Fatalf("block %d row %d: read %+v, packed %+v", k, i, got, want)
+			}
+		}
+	}
+	if cap(rows.strs) == 0 || cap(rows.shapes) == 0 {
+		t.Fatalf("no buffers kept: %d strings, %d shapes", cap(rows.strs), cap(rows.shapes))
 	}
 }

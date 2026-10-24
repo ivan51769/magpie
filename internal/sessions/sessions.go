@@ -15,7 +15,6 @@ import (
 	"bufio"
 	"bytes"
 	"cmp"
-	"encoding/json"
 	"errors"
 	"io"
 	"io/fs"
@@ -825,10 +824,6 @@ func writeCache(c *save) {
 	if saveHook != nil {
 		saveHook()
 	}
-	b, err := json.Marshal(c.cacheFile)
-	if err != nil {
-		return
-	}
 	dir := filepath.Dir(c.path)
 	if os.MkdirAll(dir, 0o755) != nil {
 		return
@@ -837,7 +832,10 @@ func writeCache(c *save) {
 	if err != nil {
 		return
 	}
-	_, err = tmp.Write(b)
+	w := bufio.NewWriterSize(tmp, 1<<20)
+	if err = encodeCache(w, c.cacheFile); err == nil {
+		err = w.Flush()
+	}
 	if cerr := tmp.Close(); err == nil {
 		err = cerr
 	}

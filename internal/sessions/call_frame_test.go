@@ -73,6 +73,9 @@ func TestDecodeFrameAsAFreshDecoder(t *testing.T) {
 // A frame of the definitions the last one had isn't compiled again: that
 // was most of the reading of a start's ~15.6k shards (#3493).
 func TestDecodeFrameKeepsDefinitions(t *testing.T) {
+	if raceOn {
+		t.Skip("-race lets a pool's decoders go")
+	}
 	data := encodedFrame(t, callFrame{Strings: []string{"", "m"}, Patches: []callPatch{{Index: 1}}})
 	var f callFrame
 	if err := decodeFrame(data, &f); err != nil {

@@ -397,10 +397,12 @@ func rowsIn(c *rowChunk) int {
 // packed copies it keeps: ~100 MB of a start that peaked at 508 MB over
 // 420k calls. A packed chunk is decoded when a pass reaches it, into a
 // buffer the next one's decode reuses, and refs still name the packed
-// chunk.
+// chunk. Its strings' and shapes' slices are reused the same way.
 type chunkRows struct {
 	c, open *rowChunk
 	buf     []packedRow
+	strs    []string
+	shapes  [][rowTexts]uint32
 }
 
 // of is c's rows to read. What the page set on c since (a Codex actor or
@@ -410,12 +412,18 @@ func (r *chunkRows) of(c *rowChunk) *rowChunk {
 		return c
 	}
 	if r.c != c {
-		open := c.unpackInto(r.buf)
+		open := c.unpackReusing(r.buf, r.strs, r.shapes)
 		if open == nil { // never written so: pack wrote it in this process
 			open = &rowChunk{Source: c.Source, Computer: c.Computer}
 		}
 		if cap(open.Rows) > cap(r.buf) {
 			r.buf = open.Rows[:0]
+		}
+		if cap(open.Strings) > cap(r.strs) {
+			r.strs = open.Strings[:0]
+		}
+		if cap(open.Shapes) > cap(r.shapes) {
+			r.shapes = open.Shapes[:0]
 		}
 		r.c, r.open = c, open
 	}
@@ -770,30 +778,35 @@ func readRequestBlocks(idx *requestIndex, st requestState, p Period, now time.Ti
 	sources, cfg, snapshot, days := st.sources, st.cfg, st.snapshot, st.days
 	price := Pricer()
 	// Swapped's names are a few hundred pairs over thousands of files' calls,
-	// and its regexps were a third of reading them again (#3493)
-	swapped := map[[2]string]bool{}
-	priceRow := func(r Record, source string) Row {
-		sent := r.Model
-		if source == "" {
-			sent = provider.SentNameIn(cfg.ModelWires, r.Provider, r.Model, r.Effort)
-		}
-		row := Row{Record: r, Source: source, Routed: GroupRouted(sent, r.Served)}
-		if r.Served != "" {
-			k := [2]string{sent, r.Served}
-			s, ok := swapped[k]
-			if !ok {
-				s = Swapped(sent, r.Served)
-				swapped[k] = s
+	// and its regexps were a third of reading them again (#3493). Each
+	// reader of the session files has a pricer of its own, with its memos.
+	pricers := func() func(Record, string) Row {
+		price := Pricer()
+		swapped := map[[2]string]bool{}
+		return func(r Record, source string) Row {
+			sent := r.Model
+			if source == "" {
+				sent = provider.SentNameIn(cfg.ModelWires, r.Provider, r.Model, r.Effort)
 			}
-			row.Swapped = s
+			row := Row{Record: r, Source: source, Routed: GroupRouted(sent, r.Served)}
+			if r.Served != "" {
+				k := [2]string{sent, r.Served}
+				s, ok := swapped[k]
+				if !ok {
+					s = Swapped(sent, r.Served)
+					swapped[k] = s
+				}
+				row.Swapped = s
+			}
+			if pr := price(r); pr != nil && r.Input+r.Output > 0 {
+				row.Priced = true
+				row.Cost = r.CostAt(*pr)
+			}
+			row.Agent, row.Client = reportedAs(r.Agent)
+			return row
 		}
-		if pr := price(r); pr != nil && r.Input+r.Output > 0 {
-			row.Priced = true
-			row.Cost = r.CostAt(*pr)
-		}
-		row.Agent, row.Client = reportedAs(r.Agent)
-		return row
 	}
+	priceRow := pricers()
 	since := p.Since(now)
 	gatewaySince := since
 	if !since.IsZero() {
@@ -818,7 +831,9 @@ func readRequestBlocks(idx *requestIndex, st requestState, p Period, now time.Ti
 	}
 	on := map[string]bool{}
 	var chunks []*rowChunk
-	var resolver *sessionResolver
+	// made once a session file is to be read again, shared by the readers:
+	// it is only read after
+	resolver := sync.OnceValue(func() *sessionResolver { return newSessionResolver([]sessions.Call{{}}) })
 	stale := func(s sessions.CallSource) bool {
 		if !since.IsZero() && s.Modified.Before(since) {
 			return false
@@ -836,7 +851,27 @@ func readRequestBlocks(idx *requestIndex, st requestState, p Period, now time.Ti
 		idx.fromDisk(want)
 	}
 	built := 0
-	read := prefetchSources(sources, stale, readSource)
+	// A file's rows are made by the reader that read it: made one after
+	// another, they were most of a cold build's wait (#3493).
+	read := prefetchEach(sources, stale, func() func(sessions.CallSource) *rowChunk {
+		priceRow := pricers()
+		return func(s sessions.CallSource) *rowChunk {
+			cs := readSource(s)
+			c := &rowChunk{Source: s, Rows: make([]packedRow, 0, len(cs))}
+			for _, call := range cs {
+				r := logRecord(call)
+				r.SessionAccount = resolver().resolve(call)
+				r.SessionOfficialLogin = resolver().officialLogin(call, r.SessionAccount)
+				r.SessionProvider = call.Upstream
+				row := priceRow(r, "log")
+				row.codexActor = codexActor(call)
+				c.add(row, call.Msg, call.To, call.Error != "")
+			}
+			c.Bytes -= int64(32 * len(c.Strings))
+			c.dict, c.shapeIDs = nil, nil // local chunks are immutable until the source changes
+			return c.pack()
+		}
+	})
 	for i, s := range sources {
 		on[s.Path] = true
 		if !since.IsZero() && s.Modified.Before(since) {
@@ -846,23 +881,7 @@ func readRequestBlocks(idx *requestIndex, st requestState, p Period, now time.Ti
 		// (chunkRows), not every file's at once
 		c := idx.chunks[s.Path]
 		if reused := c != nil && c.Source.Size == s.Size && c.Source.Modified.Equal(s.Modified); !reused {
-			if resolver == nil {
-				resolver = newSessionResolver([]sessions.Call{{}})
-			}
-			cs := read(i)
-			c = &rowChunk{Source: s, Rows: make([]packedRow, 0, len(cs))}
-			for _, call := range cs {
-				r := logRecord(call)
-				r.SessionAccount = resolver.resolve(call)
-				r.SessionOfficialLogin = resolver.officialLogin(call, r.SessionAccount)
-				r.SessionProvider = call.Upstream
-				row := priceRow(r, "log")
-				row.codexActor = codexActor(call)
-				c.add(row, call.Msg, call.To, call.Error != "")
-			}
-			c.Bytes -= int64(32 * len(c.Strings))
-			c.dict, c.shapeIDs = nil, nil // local chunks are immutable until the source changes
-			c = c.pack()
+			c = read(i)
 			c.serial = nextChunkSerial()
 			built++
 		}
@@ -1823,17 +1842,19 @@ func callerGroups[K comparable](groups map[K]*Group) []Group {
 	return out
 }
 
-// prefetchSources reads the session files a query has to parse a few at a
+// prefetchEach reads the session files a query has to parse a few at a
 // time, ahead of the loop that takes them in order. The first All after
 // magpie starts parses every one of them, and one by one that was a wait on
 // the disk for each: Requests stayed a skeleton for 40 s over 12k Codex
-// sessions. read(i) gives source i's calls; at most a window of them waits
-// to be taken, so the history is never all held at once. A source that
-// wasn't wanted is read when it is asked for.
-func prefetchSources(sources []sessions.CallSource, want func(sessions.CallSource) bool, readSource func(sessions.CallSource) []sessions.Call) func(int) []sessions.Call {
+// sessions. read(i) gives what a make from newMake made of source i; at
+// most a window of them waits to be taken, so the history is never all
+// held at once. A source that wasn't wanted is read when it is asked for.
+// Each reader, and the loop for a source not wanted, has a make of its
+// own, so what a make keeps between sources needs no lock.
+func prefetchEach[T any](sources []sessions.CallSource, want func(sessions.CallSource) bool, newMake func() func(sessions.CallSource) T) func(int) T {
 	type slot struct {
-		done  chan struct{}
-		calls []sessions.Call
+		done chan struct{}
+		v    T
 	}
 	slots := map[int]*slot{}
 	var order []int
@@ -1843,8 +1864,15 @@ func prefetchSources(sources []sessions.CallSource, want func(sessions.CallSourc
 			order = append(order, i)
 		}
 	}
+	var own func(sessions.CallSource) T
+	alone := func(i int) T {
+		if own == nil {
+			own = newMake()
+		}
+		return own(sources[i])
+	}
 	if len(order) < 2 {
-		return func(i int) []sessions.Call { return readSource(sources[i]) }
+		return alone
 	}
 	workers := min(8, len(order))
 	window := make(chan struct{}, 4*workers)
@@ -1858,22 +1886,24 @@ func prefetchSources(sources []sessions.CallSource, want func(sessions.CallSourc
 	}()
 	for range workers {
 		go func() {
+			build := newMake()
 			for i := range next {
 				s := slots[i]
-				s.calls = readSource(sources[i])
+				s.v = build(sources[i])
 				close(s.done)
 			}
 		}()
 	}
-	return func(i int) []sessions.Call {
+	return func(i int) T {
 		s := slots[i]
 		if s == nil {
-			return readSource(sources[i])
+			return alone(i)
 		}
 		<-s.done
 		<-window
-		cs := s.calls
-		s.calls = nil
-		return cs
+		v := s.v
+		var zero T
+		s.v = zero
+		return v
 	}
 }

@@ -1,8 +1,12 @@
 package sessions
 
 import (
+	"bytes"
 	"encoding/json"
+	"io"
+	"maps"
 	"runtime"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -71,6 +75,57 @@ func decodeCache(b []byte, zone string) (map[string]*state, bool) {
 		files[k] = parsed[i] // a key given twice is its last, as Unmarshal has it
 	}
 	return files, true
+}
+
+// encodeCache writes c as json.Marshal does, a file's parse at a time: one
+// Marshal of a long history's 23MB grew its buffer to twice that, ~85MB a
+// save, and a save follows every refresh that read a changed file.
+func encodeCache(w io.Writer, c cacheFile) error {
+	var b bytes.Buffer
+	enc := json.NewEncoder(&b)
+	// put appends v as Marshal has it: Encode ends it with a newline
+	put := func(v any) error {
+		if err := enc.Encode(v); err != nil {
+			return err
+		}
+		b.Truncate(b.Len() - 1)
+		return nil
+	}
+	if err := put(struct {
+		Version int    `json:"version"`
+		Zone    string `json:"zone"`
+	}{c.Version, c.Zone}); err != nil {
+		return err
+	}
+	b.Truncate(b.Len() - 1)
+	b.WriteString(`,"files":`)
+	if c.Files == nil {
+		b.WriteString("null}")
+		_, err := w.Write(b.Bytes())
+		return err
+	}
+	b.WriteByte('{')
+	for i, k := range slices.Sorted(maps.Keys(c.Files)) {
+		if i > 0 {
+			b.WriteByte(',')
+		}
+		if err := put(k); err != nil {
+			return err
+		}
+		b.WriteByte(':')
+		if err := put(c.Files[k]); err != nil {
+			return err
+		}
+		if b.Len() >= 256<<10 {
+			if _, err := w.Write(b.Bytes()); err != nil {
+				return err
+			}
+			b.Reset()
+		}
+	}
+	b.WriteString("}}")
+	_, err := w.Write(b.Bytes())
+	return err
 }
 
 // share has st's strings that many files repeat held once: an agent run
