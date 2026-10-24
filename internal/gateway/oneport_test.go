@@ -27,6 +27,7 @@ func TestClientPathCoversHandler(t *testing.T) {
 		"claudeMCPPath": claudeMCPPath, "CodexPath": CodexPath, "CodexCatalogPath": CodexCatalogPath,
 		"AlphaSearchPath": AlphaSearchPath, "HeapPath": HeapPath, "CPUPath": CPUPath,
 		"GoroutinesPath": GoroutinesPath, "SearchMCPPath": SearchMCPPath, "VisionMCPPath": VisionMCPPath,
+		"ImageMCPPath": ImageMCPPath, "ImageMCPFiles": ImageMCPFiles,
 		"ToolsMCPPath": ToolsMCPPath, "provider.RemoteCardsPath": provider.RemoteCardsPath,
 		"provider.RemoteRefreshPath": provider.RemoteRefreshPath,
 	}

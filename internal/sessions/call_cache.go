@@ -539,7 +539,7 @@ func loadCalls(f file) *callFile {
 			return nil
 		}
 		var frame callFrame
-		if gob.NewDecoder(bytes.NewReader(data)).Decode(&frame) != nil || frame.State.Path != f.path || frame.State.Agent != f.agent {
+		if decodeFrame(data, &frame) != nil || frame.State.Path != f.path || frame.State.Agent != f.agent {
 			return nil
 		}
 		if st != nil && frame.State.Off < st.Off {
