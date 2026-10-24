@@ -562,7 +562,8 @@ func distinctPaths(fs []file) []file {
 // Dirs are the folders the sessions are read from: Claude Code's and
 // Codex's, and the other agents' where they keep sessions on this computer.
 func Dirs() []string {
-	out := []string{ClaudeDir(), CodexDir()}
+	out := []string{ClaudeDir()}
+	out = append(out, CodexDirs()...)
 	var named []os.FileInfo
 	for _, d := range []struct{ dir, sessions string }{
 		{OpenCodeDir(), OpenCodeDir()},
@@ -609,7 +610,21 @@ var rolloutName = regexp.MustCompile(`^rollout-\d{4}-\d{2}-\d{2}T\d{2}-\d{2}-\d{
 // zstSuffix ends a rollout the Codex app has compressed.
 const zstSuffix = ".zst"
 
-func codexFiles() []file { return codexFilesIn(CodexDir()) }
+// codexFiles are the rollouts in every Codex folder of the user's
+// (appdir.CodexHomes): one ChatGPT account is one CODEX_HOME, and a
+// session is written into the folder of the account it ran under, so
+// reading CodexDir alone left out every other account's sessions and
+// calls (phantom3792 on X).
+func codexFiles() []file {
+	var out []file
+	for _, dir := range CodexDirs() {
+		out = append(out, codexFilesIn(dir)...)
+	}
+	return distinctPaths(out)
+}
+
+// CodexDirs are every Codex folder of the user's, CodexDir first.
+func CodexDirs() []string { return appdir.CodexHomes() }
 
 // walkLinked is filepath.WalkDir over root, which can be a link to the
 // folder: the Codex CLI keeps .codex on another drive by making

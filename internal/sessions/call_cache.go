@@ -44,6 +44,10 @@ import (
 // the version is part of the directory's name, so a cache written by an older
 // one is never read (pruneCalls).
 const callCacheVersion = "calls-v15"
+
+// CallCacheVersion is callCacheVersion, for a cache of what is made of the
+// calls (usage's requests-v1.bin).
+const CallCacheVersion = callCacheVersion
 const maxKeptCalls = 131072
 const maxKeptFiles = 64
 

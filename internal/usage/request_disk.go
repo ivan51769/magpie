@@ -2,12 +2,18 @@ package usage
 
 import (
 	"bufio"
+	"crypto/sha256"
+	"embed"
 	"encoding/binary"
 	"errors"
+	"fmt"
 	"hash/crc32"
 	"io"
+	"io/fs"
 	"os"
 	"path/filepath"
+	"strings"
+	"sync"
 	"time"
 
 	"github.com/yetone/magpie/internal/sessions"
@@ -19,7 +25,7 @@ import (
 // could show, and so did a page asked for once two idle minutes had trimmed
 // the chunks (#3493). An entry stands for its session file while the file's
 // size and mtime are the same, as a call shard does, and the whole file
-// while the binary that wrote it and what prices and names a call (the
+// while the code that wrote it and what prices and names a call (the
 // index's root and meta) are the same.
 //
 // The file is a header, then entries one after another, each its length,
@@ -32,15 +38,44 @@ func requestDiskPath() string {
 	return filepath.Join(filepath.Dir(sessions.CachePath()), "requests-v1.bin")
 }
 
-// requestDiskBinary names the binary a file was written by: a new build may
-// make a row of a call differently.
-var requestDiskBinary = func() string {
-	exe, err := os.Executable()
-	if err != nil {
-		return ""
+// requestDiskBinary names the code a file was written by: another may make
+// a row of a call differently. It was the binary itself, so every upgrade
+// read every session file again (~15.6k call shards, a cold start's
+// longest step); it is the call shards' version and this package's own
+// source, which 17 of 99 releases changed.
+var requestDiskBinary = sync.OnceValue(func() string {
+	h := sha256.New()
+	io.WriteString(h, sessions.CallCacheVersion)
+	// unread, it is the binary's, as it was
+	binary := func() string {
+		exe, err := os.Executable()
+		if err != nil {
+			return ""
+		}
+		return statKey(exe)
 	}
-	return statKey(exe)
-}
+	names, err := fs.Glob(ownSource, "*.go")
+	if err != nil || len(names) == 0 {
+		return binary()
+	}
+	for _, name := range names { // in lexical order
+		if strings.HasSuffix(name, "_test.go") {
+			continue
+		}
+		b, err := ownSource.ReadFile(name)
+		if err != nil {
+			return binary()
+		}
+		fmt.Fprintf(h, "\x00%s\x00%d\x00", name, len(b))
+		h.Write(b)
+	}
+	return fmt.Sprintf("source %x", h.Sum(nil))
+})
+
+// ownSource is this package's source, for requestDiskBinary.
+//
+//go:embed *.go
+var ownSource embed.FS
 
 // requestDiskLeast is how many session files must want reading before the
 // file is read for them: a page after a call reads one or two again.

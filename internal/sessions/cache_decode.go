@@ -145,4 +145,14 @@ func (st *state) share() {
 			}
 		}
 	}
+	// a file of one day (15,345 of a long history's 15,624) has that day's
+	// models as its own: held once, they were ~10 of the 28MB kept. A kept
+	// state is never written: a parse writes a clone, which holds them apart.
+	if len(st.Days) == 1 {
+		for _, d := range st.Days {
+			if len(d.Models) == len(st.Models) && maps.Equal(d.Models, st.Models) {
+				d.Models = st.Models
+			}
+		}
+	}
 }
