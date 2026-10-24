@@ -33,9 +33,24 @@ var rowDecodes = sync.Pool{New: func() any { return new([]byte) }}
 var rowEncodes = sync.Pool{New: func() any { return new([2][]byte) }}
 
 func (c *rowChunk) pack() *rowChunk {
-	if c == nil || len(c.Rows) < 64 || len(c.Archive) != 0 {
+	if c == nil || len(c.Rows) == 0 || len(c.Archive) != 0 {
 		return c
 	}
+	encoded, locations := c.encode(func(encoded []byte) bool { return int64(len(encoded)) < c.Bytes })
+	if encoded == nil {
+		return c
+	}
+	next := *c
+	next.Count = len(c.Rows) // what rowsIn says of it
+	next.Rows, next.Strings, next.Shapes, next.dict, next.shapeIDs = nil, nil, nil, nil, nil
+	next.Archive, next.Locations = encoded, locations
+	next.Bytes = int64(len(next.Archive)+len(locations)*8) + codexActorBytes(next.codexActors)
+	return &next
+}
+
+// encode is c's rows as an archive and the locations their times are in,
+// or nil when keep turns the compressed bytes down.
+func (c *rowChunk) encode(keep func([]byte) bool) ([]byte, []*time.Location) {
 	scratch := rowEncodes.Get().(*[2][]byte)
 	defer rowEncodes.Put(scratch)
 	data := scratch[0][:0]
@@ -87,15 +102,10 @@ func (c *rowChunk) pack() *rowChunk {
 	}
 	encoded := s2.Encode(scratch[1][:cap(scratch[1])], data)
 	scratch[1] = encoded[:0]
-	if int64(len(encoded)) >= c.Bytes {
-		return c
+	if !keep(encoded) {
+		return nil, nil
 	}
-	next := *c
-	next.Count = len(c.Rows) // what rowsIn says of it
-	next.Rows, next.Strings, next.Shapes, next.dict, next.shapeIDs = nil, nil, nil, nil, nil
-	next.Archive, next.Locations = slices.Clone(encoded), locations
-	next.Bytes = int64(len(next.Archive)+len(locations)*8) + codexActorBytes(next.codexActors)
-	return &next
+	return slices.Clone(encoded), locations
 }
 
 func (c *rowChunk) unpack() *rowChunk { return c.unpackInto(nil) }

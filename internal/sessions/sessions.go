@@ -437,6 +437,49 @@ func stat(f *file) bool {
 	return true
 }
 
+// statFiles fills in each file's size and modification time from info(i),
+// or leaves the file out when it is gone or no regular file. Every
+// Requests page walks every session folder again, and stat()ing ~16k files
+// one after another was most of that walk (#3493), so they are stat()ed on
+// a few goroutines.
+func statFiles(files []file, info func(i int) (os.FileInfo, error)) []file {
+	ok := make([]bool, len(files))
+	one := func(i int) {
+		if fi, err := info(i); err == nil && fi.Mode().IsRegular() {
+			files[i].size, files[i].mod, ok[i] = fi.Size(), fi.ModTime(), true
+		}
+	}
+	if workers := min(runtime.GOMAXPROCS(0), 8, len(files)/256); workers < 2 {
+		for i := range files {
+			one(i)
+		}
+	} else {
+		var next atomic.Int64
+		var wg sync.WaitGroup
+		for range workers {
+			wg.Go(func() {
+				for {
+					i := int(next.Add(64)) - 64
+					if i >= len(files) {
+						return
+					}
+					for j := i; j < min(i+64, len(files)); j++ {
+						one(j)
+					}
+				}
+			})
+		}
+		wg.Wait()
+	}
+	kept := files[:0]
+	for i, f := range files {
+		if ok[i] {
+			kept = append(kept, f)
+		}
+	}
+	return kept
+}
+
 // ccFiles are the session files of an agent that keeps them as Claude Code
 // does, under its folder's projects/: a session's own <id>.jsonl in its
 // project's folder, its subagents' in <id>/subagents/, and the agents of
@@ -454,9 +497,7 @@ func ccFiles(agent, dir string) []file {
 			path := filepath.Join(root, e.Name())
 			if !e.IsDir() && strings.HasSuffix(e.Name(), ".jsonl") {
 				f := file{agent: agent, key: agent + ":" + strings.TrimSuffix(e.Name(), ".jsonl"), path: path, main: true}
-				if stat(&f) {
-					out = append(out, f)
-				}
+				out = append(out, f)
 			} else if dirent.IsFolder(root, e) {
 				subs := filepath.Join(path, "subagents")
 				for _, sub := range readDirectory(subs) {
@@ -464,9 +505,7 @@ func ccFiles(agent, dir string) []file {
 						continue
 					}
 					f := file{agent: agent, key: agent + ":" + e.Name(), path: filepath.Join(subs, sub.Name())}
-					if stat(&f) {
-						out = append(out, f)
-					}
+					out = append(out, f)
 				}
 				for _, run := range readDirectory(filepath.Join(subs, "workflows")) {
 					if !dirent.IsFolder(filepath.Join(subs, "workflows"), run) {
@@ -478,15 +517,13 @@ func ccFiles(agent, dir string) []file {
 							continue
 						}
 						f := file{agent: agent, key: agent + ":" + e.Name(), path: filepath.Join(dir, sub.Name())}
-						if stat(&f) {
-							out = append(out, f)
-						}
+						out = append(out, f)
 					}
 				}
 			}
 		}
 	}
-	return out
+	return statFiles(out, func(i int) (os.FileInfo, error) { return os.Stat(out[i].path) })
 }
 
 // allFiles are every agent's session files.
@@ -605,6 +642,7 @@ func walkLinked(root string, fn fs.WalkDirFunc) error {
 // codexFilesIn are the rollouts in a Codex folder.
 func codexFilesIn(dir string) []file {
 	var out []file
+	var entries []fs.DirEntry
 	for _, folder := range []string{"sessions", "archived_sessions"} {
 		walkLinked(filepath.Join(dir, folder), func(p string, d os.DirEntry, err error) error {
 			if err != nil || d.IsDir() {
@@ -614,14 +652,12 @@ func codexFilesIn(dir string) []file {
 			if m == nil {
 				return nil
 			}
-			fi, err := d.Info()
-			if err != nil || !fi.Mode().IsRegular() {
-				return nil
-			}
-			out = append(out, file{agent: "codex", key: "codex:" + m[1], path: p, main: true, size: fi.Size(), mod: fi.ModTime()})
+			out = append(out, file{agent: "codex", key: "codex:" + m[1], path: p, main: true})
+			entries = append(entries, d)
 			return nil
 		})
 	}
+	out = statFiles(out, func(i int) (os.FileInfo, error) { return entries[i].Info() })
 	// During compression, prefer the readable plain twin in the same
 	// directory: the new compressed file may not have its trailer yet.
 	plain := map[string]bool{}
@@ -717,9 +753,10 @@ func loadCache() {
 	cacheGeneration++
 	cache = map[string]*state{}
 	saved() // the kept file as the last save left it
-	var c cacheFile
-	if b, err := os.ReadFile(CachePath()); err == nil && json.Unmarshal(b, &c) == nil && c.Version == cacheVersion && c.Zone == z && c.Files != nil {
-		cache = c.Files
+	if b, err := os.ReadFile(CachePath()); err == nil {
+		if files, ok := decodeCache(b, z); ok {
+			cache = files
+		}
 	}
 }
 

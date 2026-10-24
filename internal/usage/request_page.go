@@ -485,6 +485,12 @@ type requestIndex struct {
 	// pairs are the last pairing of each of a few periods (pairMemo),
 	// kept as parts are
 	pairs map[Period]*pairMemo
+	// on are the paths the last read listed; unsaved counts the chunks
+	// made since the file of them was last written (toDisk), and saving
+	// says a write is under way
+	on      map[string]bool
+	unsaved int
+	saving  bool
 }
 
 // heatPage is a heatmap's page, of the gateway log's snapshot version,
@@ -693,6 +699,7 @@ func queryPage(p Period, f Filter, offset, limit int, readSource func(sessions.C
 	if !shared.keep(idx, b.on) {
 		return page
 	}
+	shared.noteBuilt(b)
 	if cache != nil {
 		if shared.parts == nil || len(shared.parts) >= partSets && shared.parts[pk] == nil {
 			shared.parts = map[partKey]map[uint64]*chunkPart{}
@@ -738,6 +745,7 @@ func codexEffortOfIndex(st requestState, p Period, now time.Time) map[string][]s
 	b.priced.release()
 	shared.Lock()
 	if shared.keep(idx, b.on) {
+		shared.noteBuilt(b)
 		shared.trim(requestCacheBytes)
 	}
 	shared.Unlock()
@@ -751,6 +759,8 @@ type requestBlocks struct {
 	gateways, chunks, others []*rowChunk
 	on                       map[string]bool
 	priced                   *blockPricer
+	// built counts the session files' chunks made again
+	built int
 }
 
 // readRequestBlocks reads the blocks of p at now into idx, a private copy
@@ -809,13 +819,24 @@ func readRequestBlocks(idx *requestIndex, st requestState, p Period, now time.Ti
 	on := map[string]bool{}
 	var chunks []*rowChunk
 	var resolver *sessionResolver
-	read := prefetchSources(sources, func(s sessions.CallSource) bool {
+	stale := func(s sessions.CallSource) bool {
 		if !since.IsZero() && s.Modified.Before(since) {
 			return false
 		}
 		c := idx.chunks[s.Path]
 		return c == nil || c.Source.Size != s.Size || !c.Source.Modified.Equal(s.Modified)
-	}, readSource)
+	}
+	want := map[string]sessions.CallSource{}
+	for _, s := range sources {
+		if stale(s) {
+			want[s.Path] = s
+		}
+	}
+	if len(want) >= requestDiskLeast {
+		idx.fromDisk(want)
+	}
+	built := 0
+	read := prefetchSources(sources, stale, readSource)
 	for i, s := range sources {
 		on[s.Path] = true
 		if !since.IsZero() && s.Modified.Before(since) {
@@ -843,6 +864,7 @@ func readRequestBlocks(idx *requestIndex, st requestState, p Period, now time.Ti
 			c.dict, c.shapeIDs = nil, nil // local chunks are immutable until the source changes
 			c = c.pack()
 			c.serial = nextChunkSerial()
+			built++
 		}
 		kept, next := *c, *c
 		kept.Used, next.Used = idx.tick, idx.tick
@@ -892,7 +914,7 @@ func readRequestBlocks(idx *requestIndex, st requestState, p Period, now time.Ti
 			delete(idx.chunks, path)
 		}
 	}
-	return requestBlocks{gateways: gateways, chunks: chunks, others: others, on: on, priced: priced}
+	return requestBlocks{gateways: gateways, chunks: chunks, others: others, on: on, priced: priced, built: built}
 }
 
 // adopt drops what idx keeps of a state other than st: every chunk when
@@ -943,6 +965,40 @@ func (idx *requestIndex) keep(read *requestIndex, on map[string]bool) bool {
 		}
 	}
 	return true
+}
+
+// noteBuilt counts the chunks b made, and writes the file of them once
+// they are requestDiskLeast or more (a first read of the history): fewer
+// are a few shard reads at the next start, and not worth writing the
+// whole file (~44MB for 15.6k sessions) again. idx is locked.
+func (idx *requestIndex) noteBuilt(b requestBlocks) {
+	idx.on = b.on
+	idx.unsaved += b.built
+	if idx.unsaved >= requestDiskLeast {
+		idx.save()
+	}
+}
+
+// requestDiskSaves are the writes under way, for the tests to wait on.
+var requestDiskSaves sync.WaitGroup
+
+// save writes the file of idx's chunks behind the lock: chunks are never
+// changed once made, so a copy of the map is enough. idx is locked.
+func (idx *requestIndex) save() {
+	if idx.saving {
+		return
+	}
+	idx.saving = true
+	idx.unsaved = 0 // a write that fails is tried again only for new chunks
+	root, meta, chunks, on := idx.root, idx.meta, maps.Clone(idx.chunks), idx.on
+	requestDiskSaves.Add(1)
+	go func() {
+		defer requestDiskSaves.Done()
+		_ = toDisk(root, meta, chunks, on)
+		idx.Lock()
+		defer idx.Unlock()
+		idx.saving = false
+	}()
 }
 
 // keepWhileAsked holds the chunks to requestCacheBytes while the page is

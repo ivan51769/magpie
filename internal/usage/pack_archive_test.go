@@ -60,3 +60,22 @@ func TestPackedArchiveHoldsOnlyItsBytes(t *testing.T) {
 		t.Fatalf("read back %q and %q", ua.row(99).Model, ub.row(99).Model)
 	}
 }
+
+// A block of a few rows is packed too: most session files hold a handful
+// of calls, and a started magpie kept ~14k of them unpacked, ~98k rows
+// and ~38 MB more than the same blocks read back from requests-v1.bin.
+func TestFewRowsArePacked(t *testing.T) {
+	now := time.Now()
+	c := &rowChunk{}
+	for i := range 3 {
+		c.add(Row{Record: Record{Time: now.Add(time.Duration(i) * time.Second), Agent: "codex", Provider: "openai", Model: "gpt-5.5", Input: 1200 + i, Output: 300, Session: "s"}}, fmt.Sprint("msg", i), int64(i), false)
+	}
+	packed := c.pack()
+	if len(packed.Archive) == 0 || packed.Rows != nil || packed.Bytes >= c.Bytes {
+		t.Fatalf("3 rows: archive %d bytes, %d rows kept, %d bytes for %d", len(packed.Archive), len(packed.Rows), packed.Bytes, c.Bytes)
+	}
+	back := packed.unpack()
+	if back == nil || len(back.Rows) != 3 || back.row(2).Input != 1202 || back.row(2).Model != "gpt-5.5" {
+		t.Fatal("3 rows: not read back")
+	}
+}

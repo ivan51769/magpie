@@ -38,6 +38,9 @@ after the others, and marks a request that compacts its context with
 `off` is no mark, and a request without one is never taken for a compaction
 by its prompt. `passOnCaller` sends the mark on to a remote magpie beside
 the session, and no vendor is sent either (`TestDshMarksSessionAndCompaction`).
+Both are read on Messages and Responses as on Chat Completions, which a
+user's own llm-deepseek row pointed at magpie relies on (#3298,
+`TestDshMarksOnEveryRoute`).
 
 When the same identity is present in a native session, the native session wins
 and the gateway projection is omitted. On `/api/sessions/manage`, in its
