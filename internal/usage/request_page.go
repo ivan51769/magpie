@@ -1187,7 +1187,7 @@ func buildRequestBlocksOf(p Period, f Filter, offset, limit int, now time.Time, 
 		gateway.Chunk.setCodexCompaction(gateway.Index, compactions[local])
 	}
 	all := append(append(slices.Clone(gateways), chunks...), others...)
-	visit := func(fn func(timedRef, Row)) {
+	visit := func(fn func(timedRef, *Row)) {
 		var rows chunkRows
 		for _, c := range all {
 			open := rows.of(c)
@@ -1197,7 +1197,8 @@ func buildRequestBlocksOf(p Period, f Filter, offset, limit int, now time.Time, 
 				if pr.Time.Before(since) || after(until, pr.Time) || len(skip) > 0 && skip[ref] || len(matched) > 0 && matched[ref] {
 					continue
 				}
-				fn(timedOf(ref, pr), open.row(i))
+				r := open.row(i)
+				fn(timedOf(ref, pr), &r)
 			}
 		}
 	}
@@ -1208,9 +1209,9 @@ func buildRequestBlocksOf(p Period, f Filter, offset, limit int, now time.Time, 
 	// year the groups, shares and series below took seconds a call (#3493).
 	if p == heatmapPeriod {
 		out.Heat = heatmapOf(since, now, func(add func(Row)) {
-			visit(func(_ timedRef, r Row) {
+			visit(func(_ timedRef, r *Row) {
 				if chartFilter.keepsRow(r) {
-					add(r)
+					add(*r)
 				}
 			})
 		})
@@ -1248,7 +1249,26 @@ func buildRequestBlocksOf(p Period, f Filter, offset, limit int, now time.Time, 
 	// the rows the chart counts, kept as the first pass
 	// finds them so that theirs needn't read every row of the period again
 	var charted []rowRef
-	visit(func(ref timedRef, r Row) {
+	// Each dimension's groups are counted with its own pick cleared, and
+	// the computers' with the computer's and day's: made once, and read as
+	// the row's own keep when clearing changed nothing, which with no pick
+	// at all is every one of them. A Row is 896 bytes and a page of the
+	// whole history 400,000 of them, so each row's sums are made once (d)
+	// and added to the dozen groups it is in, not read again by each
+	// (#3493).
+	without, withoutDay := map[string]Filter{}, map[string]Filter{}
+	unpicked := map[string]bool{}
+	for _, d := range Dimensions {
+		without[d] = f.Without(d)
+		unpicked[d] = without[d] == f
+		g := without[d]
+		g.Day = ""
+		withoutDay[d] = g
+	}
+	computerFilter := f
+	computerFilter.Computer, computerFilter.Day = "", ""
+	computerUnpicked := computerFilter == f
+	visit(func(ref timedRef, r *Row) {
 		// looked up before they are set: most rows name what an earlier
 		// one did, and a map's lookup is cheaper than its write
 		if !agents[r.Agent] {
@@ -1260,8 +1280,6 @@ func buildRequestBlocksOf(p Period, f Filter, offset, limit int, now time.Time, 
 		if r.Provider != "" && !providers[r.Provider] {
 			providers[r.Provider] = true
 		}
-		addCallerRow(callers, r)
-		addAccountRow(accounts, r)
 		keep := f.keepsRow(r)
 		if keep {
 			out.Total++
@@ -1271,10 +1289,16 @@ func buildRequestBlocksOf(p Period, f Filter, offset, limit int, now time.Time, 
 				selected[0] = ref
 				heap.Fix(&selected, 0)
 			}
-			if !r.IsRejected() {
-				out.Sum.addRow(r)
+		}
+		var d Totals
+		if !r.IsRejected() {
+			d.addRow(*r)
+			if keep {
+				out.Sum.plus(&d)
 			}
 		}
+		addCallerRow(callers, r, &d)
+		addAccountRow(accounts, r, &d)
 		// The two sources are counted with the Via pick cleared, as the
 		// dimension groups above are: the cells are what the reader
 		// switches between, so each must go on saying its own number
@@ -1283,11 +1307,11 @@ func buildRequestBlocksOf(p Period, f Filter, offset, limit int, now time.Time, 
 		if !r.IsRejected() && viaFilter.keepsRow(r) {
 			switch r.Source {
 			case "log":
-				out.Direct.addRow(r)
+				out.Direct.plus(&d)
 			case SourceReported:
-				out.Reported.addRow(r)
+				out.Reported.plus(&d)
 			default:
-				out.Through.addRow(r)
+				out.Through.plus(&d)
 			}
 		}
 		if r.IsRejected() {
@@ -1295,53 +1319,44 @@ func buildRequestBlocksOf(p Period, f Filter, offset, limit int, now time.Time, 
 		}
 		if keep || f.Day != "" && chartFilter.keepsRow(r) {
 			charted = append(charted, ref.rowRef)
-			for _, d := range Dimensions {
-				k := keys.key(r, d)
-				s := seriesGroups[d][k]
+			for _, dim := range Dimensions {
+				k := keys.key(r, dim)
+				s := seriesGroups[dim][k]
 				if s == nil {
 					s = &Share{ID: k}
-					seriesGroups[d][k] = s
+					seriesGroups[dim][k] = s
 				}
-				s.addRow(r)
+				s.plus(&d)
 			}
 			if first.IsZero() || r.Time.Before(first) {
 				first = r.Time
 			}
 		}
-		if g := f; names != nil {
-			g.Computer = ""
-			g.Day = ""
-			if g.keepsRow(r) {
-				k := r.key("computer")
-				if computers[k] == nil {
-					computers[k] = &Share{ID: k}
-				}
-				computers[k].addRow(r)
+		if names != nil && (computerUnpicked && keep || !computerUnpicked && computerFilter.keepsRow(r)) {
+			k := r.key("computer")
+			if computers[k] == nil {
+				computers[k] = &Share{ID: k}
 			}
+			computers[k].plus(&d)
 		}
-		for _, d := range Dimensions {
-			g := f.Without(d)
-			if f.Day != "" {
-				g.Day = ""
-				if g.keepsRow(r) {
-					k := keys.key(r, d)
-					if chartGroups[d][k] == nil {
-						chartGroups[d][k] = &Share{ID: k}
-					}
-					chartGroups[d][k].addRow(r)
+		for _, dim := range Dimensions {
+			if f.Day != "" && withoutDay[dim].keepsRow(r) {
+				k := keys.key(r, dim)
+				if chartGroups[dim][k] == nil {
+					chartGroups[dim][k] = &Share{ID: k}
 				}
-				g.Day = f.Day
+				chartGroups[dim][k].plus(&d)
 			}
-			if !g.keepsRow(r) {
+			if unpicked[dim] && !keep || !unpicked[dim] && !without[dim].keepsRow(r) {
 				continue
 			}
-			k := keys.key(r, d)
-			s := groups[d][k]
+			k := keys.key(r, dim)
+			s := groups[dim][k]
 			if s == nil {
 				s = &Share{ID: k}
-				groups[d][k] = s
+				groups[dim][k] = s
 			}
-			s.addRow(r)
+			s.plus(&d)
 		}
 	})
 	slices.SortFunc(selected, func(a, b timedRef) int {
@@ -1411,12 +1426,14 @@ func buildRequestBlocksOf(p Period, f Filter, offset, limit int, now time.Time, 
 			continue
 		}
 		pt := &out.Series[i]
-		pt.addRow(r)
-		for _, d := range Dimensions {
-			k := keys.key(r, d)
-			part := pt.By[d][k]
-			part.add(r)
-			pt.By[d][k] = part
+		var d Totals
+		d.addRow(r)
+		pt.plus(&d)
+		for _, dim := range Dimensions {
+			k := keys.key(&r, dim)
+			part := pt.By[dim][k]
+			part.plus(&d)
+			pt.By[dim][k] = part
 		}
 	}
 	// Match LedgerSeries's top-24 selection on the filtered data, not facets.
@@ -1454,7 +1471,7 @@ func pageFromLedgerAt(p Period, f Filter, offset, limit int, all Ledgered, now t
 	viaFilter := f
 	viaFilter.Through = ""
 	for _, r := range all.Rows {
-		if r.IsRejected() || !viaFilter.keepsRow(r) {
+		if r.IsRejected() || !viaFilter.keepsRow(&r) {
 			continue
 		}
 		switch r.Source {
@@ -1470,8 +1487,10 @@ func pageFromLedgerAt(p Period, f Filter, offset, limit int, all Ledgered, now t
 	purposes := map[string]bool{}
 	for i := len(all.Rows) - 1; i >= 0; i-- {
 		purposes[PurposeOf(all.Rows[i].Kind)] = true
-		addCallerRow(callers, all.Rows[i])
-		addAccountRow(accounts, all.Rows[i])
+		var d Totals
+		d.addRow(all.Rows[i])
+		addCallerRow(callers, &all.Rows[i], &d)
+		addAccountRow(accounts, &all.Rows[i], &d)
 	}
 	for purpose := range purposes {
 		out.Purposes = append(out.Purposes, purpose)
@@ -1532,7 +1551,7 @@ func computerShares(m map[string]*Share, names map[string]string) ([]Share, map[
 }
 
 // Caller choices cover the period, not just the current page or selected key.
-func addCallerRow(groups map[string]*Group, r Row) {
+func addCallerRow(groups map[string]*Group, r *Row, d *Totals) {
 	if r.CallerKeyID == "" || r.IsRejected() {
 		return
 	}
@@ -1542,12 +1561,12 @@ func addCallerRow(groups map[string]*Group, r Row) {
 		groups[r.CallerKeyID] = g
 	}
 	g.CallerKeyName = r.CallerKeyName
-	g.addRow(r)
+	g.plus(d)
 }
 
 // Account choices cover the period too: each account that answered a call,
 // by provider, for the Account filter, whatever else is picked.
-func addAccountRow(groups map[[2]string]*Group, r Row) {
+func addAccountRow(groups map[[2]string]*Group, r *Row, d *Totals) {
 	who := r.Account()
 	if who == "" || r.IsRejected() {
 		return
@@ -1558,7 +1577,7 @@ func addAccountRow(groups map[[2]string]*Group, r Row) {
 		g = &Group{ID: r.Provider + "@" + who, Provider: r.Provider, Account: who}
 		groups[k] = g
 	}
-	g.addRow(r)
+	g.plus(d)
 }
 
 func callerGroups[K comparable](groups map[K]*Group) []Group {

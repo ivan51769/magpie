@@ -38,6 +38,11 @@ type Model struct {
 	// APIs, when the vendor says, are the APIs the model is served on
 	// ("chat", "responses", "anthropic"); empty is not known.
 	APIs []string `json:",omitempty"`
+	// Endpoints, in magpie's own models for an agent, are the gateway
+	// paths a request for it is relayed on as it is
+	// (provider.NativeEndpoints, /v1/models' native_endpoints); none for a
+	// group or a model translated anyway.
+	Endpoints []string `json:"-"`
 	// Images is set on a model that takes images as input.
 	Images bool `json:",omitempty"`
 	// ImageInput is the source's explicit answer; nil means it did not say.

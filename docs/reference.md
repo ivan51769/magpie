@@ -1049,6 +1049,21 @@ export function connect({ gateway, model, models }) {
 It is then on the Agents page like magpie's own: picking one of magpie's
 models writes the model and what `connect` returns, and its own model or
 Disconnect puts every key back as it was. It runs in moejs like middleware.
+`connect` gets `gateway` (`url`, `v1`, `key`), `model` and `models` (each
+`id`, `name`, `context`, `output`, `images`, `efforts`), and `agent`
+(`id`, `config`). Each model also has what `/v1/models` says of it, by the
+same names: `native_endpoints`, the gateway paths a request for it goes on
+untranslated, and `pricing`, USD a token as decimal strings, so an agent
+can ask a model on the API that passes straight through and show what a
+call costs. Each is left out when it isn't known (a routing group has no
+`native_endpoints`, an unpriced model no `pricing`), never empty or 0:
+
+```json
+{ "id": "deepseek/pro", "name": "pro · DeepSeek", "context": 0, "output": 0, "images": false, "efforts": [],
+  "native_endpoints": ["/v1/chat/completions"],
+  "pricing": { "prompt": "0.0000003", "completion": "0.0000012", "input_cache_read": "0.00000003" } }
+```
+
 An id magpie's own agents use is refused. In the market an agent's entry has
 `"kind": "agent"` (`@magpie-community/agent-<name>`). The full reference is
 on the site's Plugins page, under Agent plugins.
