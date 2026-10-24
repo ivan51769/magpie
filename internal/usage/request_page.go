@@ -621,23 +621,12 @@ func queryPage(p Period, f Filter, offset, limit int, readSource func(sessions.C
 		return pageFromLedgerAt(p, f, offset, limit, LedgerOfAt(p, Filter{}, now), now)
 	}
 	st := readRequestState(now)
-	sources, codexIdentities, cfg, snapshot, days, someShared := st.sources, st.codexIdentities, st.cfg, st.snapshot, st.days, st.someShared
-	version, meta, key, root := snapshot.version, st.meta, st.key, st.root
+	codexIdentities, snapshot, someShared := st.codexIdentities, st.snapshot, st.someShared
+	version, key := snapshot.version, st.key
 	idx := &requestCache
 	idx.Lock()
 	idx.keepWhileAsked()
-
-	if idx.root != root || idx.meta != meta {
-		idx.root, idx.meta = root, meta
-		idx.chunks = map[string]*rowChunk{}
-		idx.pages = nil
-		idx.heats = nil
-		idx.key = ""
-	}
-	if idx.key != key {
-		idx.pages = map[pageKey]RequestPage{}
-		idx.key = key
-	}
+	idx.adopt(st)
 	q := pageKey{p, f, offset, limit, now.Format(time.DateOnly)}
 	if page, ok := idx.pages[q]; ok {
 		idx.Unlock()
@@ -668,13 +657,76 @@ func queryPage(p Period, f Filter, offset, limit int, readSource func(sessions.C
 		fl.page = page
 		close(fl.done)
 	}()
-	idx.tick++
-	// Copy only metadata while holding the lock. Published chunks are immutable;
-	// reading, decoding, pricing and aggregation use a private snapshot.
 	shared := idx
-	idx = &requestIndex{root: idx.root, meta: idx.meta, key: idx.key, tick: idx.tick,
-		chunks: maps.Clone(idx.chunks)}
+	idx = shared.private()
 	shared.Unlock()
+	b := readRequestBlocks(idx, st, p, now, readSource)
+	var names map[string]string
+	if someShared {
+		names = sharedNames()
+	}
+	if building != nil {
+		building()
+	}
+	page = buildRequestBlocksWithCodex(p, f, offset, limit, now, b.gateways, b.chunks, b.others, names, codexIdentities)
+	b.priced.release()
+	shared.Lock()
+	defer shared.Unlock()
+	if !shared.keep(idx, b.on) {
+		return page
+	}
+	if len(shared.pages) >= 16 {
+		shared.pages = map[pageKey]RequestPage{}
+	}
+	shared.pages[q] = page
+	if p == heatmapPeriod {
+		if shared.heats == nil || len(shared.heats) >= 16 {
+			shared.heats = map[pageKey]heatPage{}
+		}
+		shared.heats[q] = heatPage{page: page, version: version, at: began}
+	}
+	shared.trim(requestCacheBytes)
+	return page
+}
+
+// codexEffortOfIndex is codexModelEffort of p's Codex rows, read through
+// the request index as a page is: a build after a call reads only the
+// session files that changed, where reading the ledger again opened every
+// Codex shard there is (#3493).
+func codexEffortOfIndex(st requestState, p Period, now time.Time) map[string][]sessions.ModelEffort {
+	shared := &requestCache
+	shared.Lock()
+	shared.keepWhileAsked()
+	shared.adopt(st)
+	idx := shared.private()
+	shared.Unlock()
+	b := readRequestBlocks(idx, st, p, now, sessions.ReadCallSource)
+	_, visit := pairedRows(p, now, b.gateways, b.chunks, b.others, st.codexIdentities)
+	sums := effortSums{}
+	visit(func(_ timedRef, r *Row) { sums.add(r) })
+	b.priced.release()
+	shared.Lock()
+	if shared.keep(idx, b.on) {
+		shared.trim(requestCacheBytes)
+	}
+	shared.Unlock()
+	return sums.values()
+}
+
+// requestBlocks are what a page of a period is worked out from: the
+// gateway's blocks of it, priced, the session files' chunks and the other
+// computers' days, and the paths the index holds now (on).
+type requestBlocks struct {
+	gateways, chunks, others []*rowChunk
+	on                       map[string]bool
+	priced                   *blockPricer
+}
+
+// readRequestBlocks reads the blocks of p at now into idx, a private copy
+// of the request index (private): a session file or another computer's
+// day is read again only when it changed since its chunk was made.
+func readRequestBlocks(idx *requestIndex, st requestState, p Period, now time.Time, readSource func(sessions.CallSource) []sessions.Call) requestBlocks {
+	sources, cfg, snapshot, days := st.sources, st.cfg, st.snapshot, st.days
 	price := Pricer()
 	// Swapped's names are a few hundred pairs over thousands of files' calls,
 	// and its regexps were a third of reading them again (#3493)
@@ -807,43 +859,55 @@ func queryPage(p Period, f Filter, offset, limit int, readSource func(sessions.C
 			delete(idx.chunks, path)
 		}
 	}
-	var names map[string]string
-	if someShared {
-		names = sharedNames()
+	return requestBlocks{gateways: gateways, chunks: chunks, others: others, on: on, priced: priced}
+}
+
+// adopt drops what idx keeps of a state other than st: every chunk when
+// what prices or names a call changed (meta), the pages when anything
+// did (key). idx is locked.
+func (idx *requestIndex) adopt(st requestState) {
+	if idx.root != st.root || idx.meta != st.meta {
+		idx.root, idx.meta = st.root, st.meta
+		idx.chunks = map[string]*rowChunk{}
+		idx.pages = nil
+		idx.heats = nil
+		idx.key = ""
 	}
-	if building != nil {
-		building()
+	if idx.key != st.key {
+		idx.pages = map[pageKey]RequestPage{}
+		idx.key = st.key
 	}
-	page = buildRequestBlocksWithCodex(p, f, offset, limit, now, gateways, chunks, others, names, codexIdentities)
-	priced.release()
-	shared.Lock()
-	defer shared.Unlock()
-	// A query for an older filesystem snapshot may finish after a newer one.
-	if shared.root != idx.root || shared.meta != idx.meta || shared.key != idx.key || snapshot.version != version {
-		return page
+}
+
+// private is a copy of idx's metadata and chunk map to read into without
+// its lock: published chunks are immutable, and reading, decoding, pricing
+// and aggregation use the copy. It counts a use of idx (tick). idx is
+// locked.
+func (idx *requestIndex) private() *requestIndex {
+	idx.tick++
+	return &requestIndex{root: idx.root, meta: idx.meta, key: idx.key, tick: idx.tick,
+		chunks: maps.Clone(idx.chunks)}
+}
+
+// keep takes into idx the chunks read into read, its private copy, when
+// they are of the state idx is in: a read of an older filesystem snapshot
+// may finish after a newer one. on are the paths read holds. idx is
+// locked.
+func (idx *requestIndex) keep(read *requestIndex, on map[string]bool) bool {
+	if idx.root != read.root || idx.meta != read.meta || idx.key != read.key {
+		return false
 	}
-	for path, c := range idx.chunks {
-		if prev := shared.chunks[path]; prev == nil || prev.Used <= c.Used {
-			shared.chunks[path] = c
+	for path, c := range read.chunks {
+		if prev := idx.chunks[path]; prev == nil || prev.Used <= c.Used {
+			idx.chunks[path] = c
 		}
 	}
-	for path := range shared.chunks {
+	for path := range idx.chunks {
 		if !on[path] {
-			delete(shared.chunks, path)
+			delete(idx.chunks, path)
 		}
 	}
-	if len(shared.pages) >= 16 {
-		shared.pages = map[pageKey]RequestPage{}
-	}
-	shared.pages[q] = page
-	if p == heatmapPeriod {
-		if shared.heats == nil || len(shared.heats) >= 16 {
-			shared.heats = map[pageKey]heatPage{}
-		}
-		shared.heats[q] = heatPage{page: page, version: version, at: began}
-	}
-	shared.trim(requestCacheBytes)
-	return page
+	return true
 }
 
 // keepWhileAsked holds the chunks to requestCacheBytes while the page is
@@ -1200,7 +1264,12 @@ func ownStrings(v reflect.Value) {
 	}
 }
 
-func buildRequestBlocksOf(p Period, f Filter, offset, limit int, now time.Time, gateways, chunks, others []*rowChunk, names map[string]string, identities map[string]sessions.CodexIdentity) RequestPage {
+// pairedRows are the page's rows of p: each gateway call told the Codex
+// thread of the session file's call it is paired with, and the session
+// files' calls a gateway call matched, or another file's copy, left out.
+// visit hands each row on in all's order. The chunks are copies, so the
+// cached ones are left as they are.
+func pairedRows(p Period, now time.Time, gateways, chunks, others []*rowChunk, identities map[string]sessions.CodexIdentity) (all []*rowChunk, visit func(fn func(timedRef, *Row))) {
 	gateways, chunks, others = cloneCodexChunks(gateways), cloneCodexChunks(chunks), cloneCodexChunks(others)
 	duplicateSkip := foldCodexRows(chunks)
 	pairs, compactions := codexChunkResponsePairs(gateways, chunks, duplicateSkip)
@@ -1223,9 +1292,13 @@ func buildRequestBlocksOf(p Period, f Filter, offset, limit int, now time.Time, 
 		setCodexActor(gateway.Chunk, gateway.Index, actor)
 		gateway.Chunk.setCodexCompaction(gateway.Index, compactions[local])
 	}
-	all := append(append(slices.Clone(gateways), chunks...), others...)
-	visit := func(fn func(timedRef, *Row)) {
+	all = append(append(slices.Clone(gateways), chunks...), others...)
+	visit = func(fn func(timedRef, *Row)) {
 		var rows chunkRows
+		// one row for the visit, written over for each: fn is not known
+		// here, so a row of each would be an allocation of its own, and fn
+		// keeps none of them
+		var r Row
 		for _, c := range all {
 			open := rows.of(c)
 			for i := range open.Rows {
@@ -1234,11 +1307,17 @@ func buildRequestBlocksOf(p Period, f Filter, offset, limit int, now time.Time, 
 				if pr.Time.Before(since) || after(until, pr.Time) || len(skip) > 0 && skip[ref] || len(matched) > 0 && matched[ref] {
 					continue
 				}
-				r := open.row(i)
+				r = open.row(i)
 				fn(timedOf(ref, pr), &r)
 			}
 		}
 	}
+	return all, visit
+}
+
+func buildRequestBlocksOf(p Period, f Filter, offset, limit int, now time.Time, gateways, chunks, others []*rowChunk, names map[string]string, identities map[string]sessions.CodexIdentity) RequestPage {
+	since := p.Since(now)
+	all, visit := pairedRows(p, now, gateways, chunks, others, identities)
 	out := RequestPage{Rows: []Row{}, Agents: []string{}, Providers: []string{}, Purposes: []string{}, By: map[string][]Share{}}
 	chartFilter := f
 	chartFilter.Day = ""

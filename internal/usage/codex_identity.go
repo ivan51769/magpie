@@ -440,10 +440,7 @@ func CodexModelEffort(p Period) map[string][]sessions.ModelEffort {
 	if effortBuilt != nil {
 		effortBuilt()
 	}
-	// Only Codex's own calls carry a Codex thread: a gateway call is told
-	// its thread by the Codex call that has its response id, so the other
-	// agents' session files are not read for this.
-	value = codexModelEffort(codexEffortRows(p, now, codexCalls))
+	value = codexEffortOfIndex(st, p, now)
 	return cloneEffort(value)
 }
 
@@ -537,37 +534,51 @@ func cloneEffort(values map[string][]sessions.ModelEffort) map[string][]sessions
 }
 
 func codexModelEffort(rows []Row) map[string][]sessions.ModelEffort {
-	type modelEffortKey struct{ model, effort string }
-	type total struct {
-		value  sessions.ModelEffort
-		priced bool
+	sums := effortSums{}
+	for i := range rows {
+		sums.add(&rows[i])
 	}
-	groups := map[string]map[modelEffortKey]*total{}
-	for _, row := range rows {
-		if row.codexActor == "" || row.IsRejected() ||
-			row.Input+row.Output+row.CacheRead+row.CacheWrite == 0 {
-			continue
-		}
-		byModel := groups[row.codexActor]
-		if byModel == nil {
-			byModel = map[modelEffortKey]*total{}
-			groups[row.codexActor] = byModel
-		}
-		key := modelEffortKey{row.Model, row.Effort}
-		entry := byModel[key]
-		if entry == nil {
-			entry = &total{value: sessions.ModelEffort{Model: row.Model, Effort: row.Effort}, priced: true}
-			byModel[key] = entry
-		}
-		entry.priced = entry.priced && row.Priced
-		entry.value.Input += row.Input
-		entry.value.Output += row.Output
-		entry.value.CacheRead += row.CacheRead
-		entry.value.CacheWrite += row.CacheWrite
-		entry.value.CacheWrite1h += row.CacheWrite1h
-		entry.value.Reasoning += row.Reasoning
-		entry.value.Cost += row.Cost
+	return sums.values()
+}
+
+type modelEffortKey struct{ model, effort string }
+
+type effortTotal struct {
+	value  sessions.ModelEffort
+	priced bool
+}
+
+// effortSums adds rows up by Codex thread, model and effort as they are
+// visited, so that no build holds the rows themselves.
+type effortSums map[string]map[modelEffortKey]*effortTotal
+
+func (groups effortSums) add(row *Row) {
+	if row.codexActor == "" || row.IsRejected() ||
+		row.Input+row.Output+row.CacheRead+row.CacheWrite == 0 {
+		return
 	}
+	byModel := groups[row.codexActor]
+	if byModel == nil {
+		byModel = map[modelEffortKey]*effortTotal{}
+		groups[row.codexActor] = byModel
+	}
+	key := modelEffortKey{row.Model, row.Effort}
+	entry := byModel[key]
+	if entry == nil {
+		entry = &effortTotal{value: sessions.ModelEffort{Model: row.Model, Effort: row.Effort}, priced: true}
+		byModel[key] = entry
+	}
+	entry.priced = entry.priced && row.Priced
+	entry.value.Input += row.Input
+	entry.value.Output += row.Output
+	entry.value.CacheRead += row.CacheRead
+	entry.value.CacheWrite += row.CacheWrite
+	entry.value.CacheWrite1h += row.CacheWrite1h
+	entry.value.Reasoning += row.Reasoning
+	entry.value.Cost += row.Cost
+}
+
+func (groups effortSums) values() map[string][]sessions.ModelEffort {
 	out := make(map[string][]sessions.ModelEffort, len(groups))
 	for actor, byModel := range groups {
 		values := make([]sessions.ModelEffort, 0, len(byModel))

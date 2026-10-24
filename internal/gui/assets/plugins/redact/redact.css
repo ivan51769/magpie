@@ -225,8 +225,12 @@ body.window .msk-onebar::before { inset: -6px -16px; }
   .msk-steps { grid-template-columns: repeat(auto-fill, minmax(120px, 1fr)); row-gap: 12px; }
   .msk-steps li + li::before { display: none; }
 }
-@container (max-width: 640px) {
+/* below this the flow beside the number leaves its middle under ~120px:
+   the lines bunch up and the providers' names are cut, so it goes under */
+@container (max-width: 780px) {
   .msk-band { grid-template-columns: minmax(0, 1fr); gap: 16px; }
+}
+@container (max-width: 640px) {
   .mo-flow { grid-template-columns: minmax(0, 1fr) minmax(48px, 1fr) minmax(0, 1fr); gap: 4px; }
   .msk-model, .msk-kind:not(:first-child), .msk-kind.more { display: none; }
   .msk-msgs.both .msk-mbody, .msk-cols { grid-template-columns: minmax(0, 1fr); }
