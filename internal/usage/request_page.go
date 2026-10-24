@@ -495,10 +495,13 @@ type requestIndex struct {
 	pairs map[Period]*pairMemo
 	// on are the paths the last read listed; unsaved counts the chunks
 	// made since the file of them was last written (toDisk), and saving
-	// says a write is under way
-	on      map[string]bool
-	unsaved int
-	saving  bool
+	// says a write is under way; unsavedRows counts their rows, and
+	// savedRows says a write was made for them (once a run)
+	on          map[string]bool
+	unsaved     int
+	unsavedRows int
+	saving      bool
+	savedRows   bool
 }
 
 // heatPage is a heatmap's page, of the gateway log's snapshot version,
@@ -767,8 +770,9 @@ type requestBlocks struct {
 	gateways, chunks, others []*rowChunk
 	on                       map[string]bool
 	priced                   *blockPricer
-	// built counts the session files' chunks made again
-	built int
+	// built counts the session files' chunks made again, and builtRows
+	// their rows
+	built, builtRows int
 }
 
 // readRequestBlocks reads the blocks of p at now into idx, a private copy
@@ -850,7 +854,7 @@ func readRequestBlocks(idx *requestIndex, st requestState, p Period, now time.Ti
 	if len(want) >= requestDiskLeast {
 		idx.fromDisk(want)
 	}
-	built := 0
+	built, builtRows := 0, 0
 	// A file's rows are made by the reader that read it: made one after
 	// another, they were most of a cold build's wait (#3493).
 	read := prefetchEach(sources, stale, func() func(sessions.CallSource) *rowChunk {
@@ -884,6 +888,7 @@ func readRequestBlocks(idx *requestIndex, st requestState, p Period, now time.Ti
 			c = read(i)
 			c.serial = nextChunkSerial()
 			built++
+			builtRows += c.Count
 		}
 		kept, next := *c, *c
 		kept.Used, next.Used = idx.tick, idx.tick
@@ -933,7 +938,7 @@ func readRequestBlocks(idx *requestIndex, st requestState, p Period, now time.Ti
 			delete(idx.chunks, path)
 		}
 	}
-	return requestBlocks{gateways: gateways, chunks: chunks, others: others, on: on, priced: priced, built: built}
+	return requestBlocks{gateways: gateways, chunks: chunks, others: others, on: on, priced: priced, built: built, builtRows: builtRows}
 }
 
 // adopt drops what idx keeps of a state other than st: every chunk when
@@ -989,14 +994,27 @@ func (idx *requestIndex) keep(read *requestIndex, on map[string]bool) bool {
 // noteBuilt counts the chunks b made, and writes the file of them once
 // they are requestDiskLeast or more (a first read of the history): fewer
 // are a few shard reads at the next start, and not worth writing the
-// whole file (~44MB for 15.6k sessions) again. idx is locked.
+// whole file (~44MB for 15.6k sessions) again. Or once a run, when they
+// hold requestDiskLeastRows rows: a few long sessions that ended since
+// the last write (9 files, 84.6k calls, ~1s) were made again at every
+// start, and the next ones that end joined them, until they were
+// requestDiskLeast files. Once, as a session still at work grows with
+// every call and is made again for each. idx is locked.
 func (idx *requestIndex) noteBuilt(b requestBlocks) {
 	idx.on = b.on
 	idx.unsaved += b.built
+	idx.unsavedRows += b.builtRows
 	if idx.unsaved >= requestDiskLeast {
+		idx.save()
+	} else if !idx.savedRows && idx.unsavedRows >= requestDiskLeastRows {
+		idx.savedRows = true
 		idx.save()
 	}
 }
+
+// requestDiskLeastRows is how many rows of chunks made since the last
+// write have the file written once a run, whatever their files.
+var requestDiskLeastRows = 20000
 
 // requestDiskSaves are the writes under way, for the tests to wait on.
 var requestDiskSaves sync.WaitGroup
@@ -1008,7 +1026,7 @@ func (idx *requestIndex) save() {
 		return
 	}
 	idx.saving = true
-	idx.unsaved = 0 // a write that fails is tried again only for new chunks
+	idx.unsaved, idx.unsavedRows = 0, 0 // a write that fails is tried again only for new chunks
 	root, meta, chunks, on := idx.root, idx.meta, maps.Clone(idx.chunks), idx.on
 	requestDiskSaves.Add(1)
 	go func() {
