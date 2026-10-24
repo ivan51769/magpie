@@ -145,12 +145,12 @@ var rules = append([]rule{
 	{kind: "PASSWORD", re: regexp.MustCompile(`[A-Za-z][A-Za-z0-9+.-]*://[^\s:@/?#"'<>]+:([^\s@/?#"'<>]{3,})@`), markers: []string{"://"}, ok: notAVariable},
 	// password = …, API_KEY: "…", as .env files and configs have them
 	{kind: "SECRET", re: regexp.MustCompile(`(?i)[A-Za-z0-9_.-]*(?:` + secretNames.pattern() + `)[A-Za-z0-9_.-]*` + quote + `[ \t]*[:=][ \t]*` + quote + `(` + secretCh + `{8,})`),
-		markers: secretNames.markers(), ok: secretValue},
+		markers: secretNames.markers(), ok: secretValue, at: notCode},
 	// a field called key and nothing more, as providers.json has one: "key":
 	// "oc_sk_…" (#195). Only a long value of letters and digits both, since
 	// code calls anything a key: a map's "key": "value", sort_key, keyboard.
 	{kind: "SECRET", re: regexp.MustCompile(`(?i)(?:^|[^A-Za-z0-9_.-])` + quote + `key` + quote + `[ \t]*[:=][ \t]*` + quote + `(` + secretCh + `{16,})`),
-		markers: fieldNames{{"key", "key"}}.markers(), ok: secretValue},
+		markers: fieldNames{{"key", "key"}}.markers(), ok: secretValue, at: notCode},
 
 	{kind: "EMAIL", re: regexp.MustCompile(`[A-Za-z0-9._%+-]+@[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)*\.[A-Za-z]{2,}`), markers: []string{"@"}, bound: alnum + "._%+-", ok: realEmail, cat: catPersonal},
 	{kind: "ID_CARD", re: regexp.MustCompile(`[1-9]\d{5}(?:18|19|20)\d{2}(?:0[1-9]|1[0-2])(?:0[1-9]|[12]\d|3[01])\d{3}[\dXx]`), bound: alnum, ok: chineseID, cat: catPersonal},
@@ -221,6 +221,30 @@ func secretValue(v string) bool {
 		return false
 	}
 	return strings.ContainsAny(v, digits) && strings.IndexFunc(v, func(r rune) bool { return r >= 'A' && r <= 'Z' || r >= 'a' && r <= 'z' }) >= 0
+}
+
+// identPath is a name in code, or a field read through one: Uint8Array,
+// details.2, opts.token2.
+var identPath = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z0-9_]+)*$`)
+
+// notCode turns away a value at s[a:b] that is code naming a secret, not
+// the secret: a call (privateKey: toBase64Url(…), secretKey =
+// fromBase64Url(…)), or, unquoted after a colon, a type or a read that
+// code goes on from (secretKey: Uint8Array;, private_key: details.2,).
+// A secret written in code is a string, so in quotes; one after = or at a
+// line's end (.env files, logs, YAML) is kept (Kieran Zhang on X, 10-25).
+func notCode(s string, a, b int) bool {
+	if !identPath.MatchString(s[a:b]) {
+		return true
+	}
+	rest := strings.TrimLeft(s[b:], " \t")
+	if strings.HasPrefix(rest, "(") {
+		return false
+	}
+	if a > 0 && (s[a-1] == '"' || s[a-1] == '\'') || !strings.HasSuffix(strings.TrimRight(s[:a], " \t"), ":") {
+		return true
+	}
+	return rest == "" || !strings.ContainsRune(";,)}]|?&<>", rune(rest[0]))
 }
 
 func realEmail(v string) bool {

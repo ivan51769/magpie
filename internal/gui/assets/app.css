@@ -1440,6 +1440,7 @@ body.window .field.solo { grid-column: auto; }
 .led .src.access-subscription { --badge-ink: var(--tk-k); }
 .led .src.proto { --badge-ink: var(--muted); font-weight: 500; }
 .led .src.reported { --badge-ink: var(--tk-o); }
+.led .src.probe { --badge-ink: var(--muted); }
 .led .duration { font-weight: 550; }
 .led .duration-fast { color: var(--tk-s); }
 .led .duration-slow { color: var(--amber); }

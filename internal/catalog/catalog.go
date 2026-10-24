@@ -1297,6 +1297,24 @@ func listedBy(providers []string, id string, providerOverrides bool) ([]string, 
 	return nil, false
 }
 
+// variantSuffix is a word a proxy puts after a model's id to name the
+// level or speed it serves the model at: CLIProxyAPI's Antigravity
+// channel lists gemini-3.8-flash-high, claude-opus-5-5-high,
+// claude-opus-4-6-thinking and gpt-oss-120b-medium, and its xAI channel
+// grok-3-mini-fast. Its "(high)" form is found's.
+var variantSuffix = regexp.MustCompile(`(?i)-(minimal|low|medium|high|xhigh|max|thinking|fast)$`)
+
+// Unsuffixed is id with a proxy's level or speed word taken off
+// (variantSuffix), and whether it had one. It is for borrowing levels a
+// model has no word on alone: the vendor's own list, which may name a
+// model so, goes first.
+func Unsuffixed(id string) (string, bool) {
+	if loc := variantSuffix.FindStringIndex(id); loc != nil && loc[0] > 0 {
+		return id[:loc[0]], true
+	}
+	return "", false
+}
+
 // KinEfforts are the reasoning levels of a model none of the providers
 // named lists, taken from the newest of their thinking models of the same
 // name but for its version (gpt-6.1-sol's from gpt-6-sol, mimo-v2.7-flash's

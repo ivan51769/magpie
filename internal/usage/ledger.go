@@ -105,7 +105,7 @@ const (
 // under its totals that local rejections are not counted — so it is "" and
 // picking either cell leaves it out, as the cells' own counts already do.
 func SourceOf(r Row) string {
-	if r.IsRejected() {
+	if r.IsRejected() || r.IsProbe() { // magpie's own test is neither too
 		return ""
 	}
 	switch r.Source {

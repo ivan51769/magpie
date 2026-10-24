@@ -473,6 +473,8 @@ type requestIndex struct {
 	// heats are the heatmap's last pages, kept while the agents' session
 	// files are all that changed (heatFresh)
 	heats map[pageKey]heatPage
+	// idle trims the chunks once the page goes unasked (keepWhileAsked)
+	idle *time.Timer
 }
 
 // heatPage is a heatmap's page, of the gateway log's snapshot version,
@@ -506,7 +508,18 @@ type pageFlight struct {
 
 var requestCache requestIndex
 
-var requestCacheBytes int64 = 24 << 20
+// requestCacheBytes bounds the session files' chunks kept while the
+// Requests page is in use, and requestIdleBytes once it has gone unasked
+// for requestIdle. Every new call is a new page key, so the open page
+// is worked out again each refresh, and a chunk dropped is a shard read,
+// decoded and priced again for each: at 24 MB a history of 416,000 calls
+// (63 MB of chunks) read 2,679 shards again on every refresh, a third of
+// its CPU (#3493). Idle, it is held to what it was before.
+var (
+	requestCacheBytes int64 = 128 << 20
+	requestIdleBytes  int64 = 24 << 20
+	requestIdle             = 2 * time.Minute
+)
 
 func statKey(path string) string {
 	s, e := os.Stat(path)
@@ -547,8 +560,7 @@ type requestState struct {
 }
 
 func readRequestState(now time.Time) requestState {
-	sources := sessions.CallSources()
-	codexIdentities := sessions.CodexIdentities()
+	sources, codexIdentities := sessions.CallSourcesAndCodexIdentities()
 	slices.SortFunc(sources, func(a, b sessions.CallSource) int {
 		if n := a.Modified.Compare(b.Modified); n != 0 {
 			return n
@@ -613,6 +625,7 @@ func queryPage(p Period, f Filter, offset, limit int, readSource func(sessions.C
 	version, meta, key, root := snapshot.version, st.meta, st.key, st.root
 	idx := &requestCache
 	idx.Lock()
+	idx.keepWhileAsked()
 
 	if idx.root != root || idx.meta != meta {
 		idx.root, idx.meta = root, meta
@@ -706,6 +719,9 @@ func queryPage(p Period, f Filter, offset, limit int, readSource func(sessions.C
 		if c := priced.block(packed); c != nil {
 			gateways = append(gateways, c)
 		}
+	}
+	if c := probeChunk(snapshot.probes, gatewaySince); c != nil {
+		gateways = append(gateways, c) // listed, never counted (SourceProbe)
 	}
 	on := map[string]bool{}
 	var chunks []*rowChunk
@@ -826,15 +842,37 @@ func queryPage(p Period, f Filter, offset, limit int, readSource func(sessions.C
 		}
 		shared.heats[q] = heatPage{page: page, version: version, at: began}
 	}
-	// The session files' chunks are bounded; the gateway's index is not
-	// counted here, as it is kept whatever its size (log_index.go).
+	shared.trim(requestCacheBytes)
+	return page
+}
+
+// keepWhileAsked holds the chunks to requestCacheBytes while the page is
+// asked for, and to requestIdleBytes once it has gone unasked for
+// requestIdle. idx is locked.
+func (idx *requestIndex) keepWhileAsked() {
+	if idx.idle != nil {
+		idx.idle.Reset(requestIdle)
+		return
+	}
+	idx.idle = time.AfterFunc(requestIdle, func() {
+		idx.Lock()
+		defer idx.Unlock()
+		idx.trim(requestIdleBytes)
+	})
+}
+
+// trim drops the chunks used longest ago until the rest are within bound.
+// The session files' chunks are bounded; the gateway's index is not
+// counted here, as it is kept whatever its size (log_index.go). idx is
+// locked.
+func (idx *requestIndex) trim(bound int64) {
 	var bytes int64
 	type cachedChunk struct {
 		path string
 		row  *rowChunk
 	}
 	var kept []cachedChunk
-	for path, c := range shared.chunks {
+	for path, c := range idx.chunks {
 		bytes += c.Bytes
 		kept = append(kept, cachedChunk{path: path, row: c})
 	}
@@ -848,13 +886,12 @@ func queryPage(p Period, f Filter, offset, limit int, readSource func(sessions.C
 		return strings.Compare(a.path, b.path)
 	})
 	for _, c := range kept {
-		if bytes <= requestCacheBytes {
+		if bytes <= bound {
 			break
 		}
-		delete(shared.chunks, c.path)
+		delete(idx.chunks, c.path)
 		bytes -= c.row.Bytes
 	}
-	return page
 }
 
 // localRefs visits first occurrences of Claude message IDs. It stores only
@@ -1280,6 +1317,9 @@ func buildRequestBlocksOf(p Period, f Filter, offset, limit int, now time.Time, 
 		if r.Provider != "" && !providers[r.Provider] {
 			providers[r.Provider] = true
 		}
+		// a call turned away, and a request magpie sent on its own
+		// (SourceProbe), are listed and counted in no total
+		uncounted := r.IsRejected() || r.IsProbe()
 		keep := f.keepsRow(r)
 		if keep {
 			out.Total++
@@ -1291,20 +1331,20 @@ func buildRequestBlocksOf(p Period, f Filter, offset, limit int, now time.Time, 
 			}
 		}
 		var d Totals
-		if !r.IsRejected() {
+		if !uncounted {
 			d.addRow(*r)
 			if keep {
 				out.Sum.plus(&d)
 			}
+			addCallerRow(callers, r, &d)
+			addAccountRow(accounts, r, &d)
 		}
-		addCallerRow(callers, r, &d)
-		addAccountRow(accounts, r, &d)
 		// The two sources are counted with the Via pick cleared, as the
 		// dimension groups above are: the cells are what the reader
 		// switches between, so each must go on saying its own number
 		// while another is picked, or one of them would read 0 and
 		// there would be no way back.
-		if !r.IsRejected() && viaFilter.keepsRow(r) {
+		if !uncounted && viaFilter.keepsRow(r) {
 			switch r.Source {
 			case "log":
 				out.Direct.plus(&d)
@@ -1314,7 +1354,7 @@ func buildRequestBlocksOf(p Period, f Filter, offset, limit int, now time.Time, 
 				out.Through.plus(&d)
 			}
 		}
-		if r.IsRejected() {
+		if uncounted {
 			return
 		}
 		if keep || f.Day != "" && chartFilter.keepsRow(r) {

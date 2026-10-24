@@ -403,6 +403,9 @@ type Server struct {
 	// taken off it (see Relisten)
 	lnMu sync.Mutex
 	ln   net.Listener
+	// front is Front's handler, built once
+	frontOnce sync.Once
+	front     http.Handler
 	// handedOff: another magpie serves the port now, and this one's end
 	// waits for its requests in flight to finish (handover.go)
 	handedOff atomic.Bool
@@ -582,7 +585,7 @@ func (s *Server) ListenAndServe(ctx context.Context) error {
 	freshCtx, stopFresh := context.WithCancel(ctx)
 	defer stopFresh()
 	go pluginrt.KeepFresh(freshCtx, 2*time.Second, settings.Path(), provider.Path(), plugin.ListPath(), plugin.ToolsPath(), access.Path())
-	srv := &http.Server{Handler: lanGuard(s.Handler()), ReadHeaderTimeout: 30 * time.Second, IdleTimeout: 5 * time.Minute}
+	srv := &http.Server{Handler: s.Front(), ReadHeaderTimeout: 30 * time.Second, IdleTimeout: 5 * time.Minute}
 	// the magpie serving the gateway, and only it, keeps the saved accounts
 	// signed in, so two never refresh one sign-in at once
 	go provider.KeepLoginsAlive(ctx)

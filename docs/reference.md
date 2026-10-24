@@ -1780,8 +1780,18 @@ External clients behind a reverse proxy need an enabled gateway key
 them, unless the proxy authenticates its clients itself
 (`MAGPIE_TRUST_PROXY=1`, below). A public URL with no port of
 its own — a reverse proxy's `https://magpie.example.com` — is the address
-`magpie web` prints for its own page too, so the proxy must forward `/v1`
-and `/v1beta` to the gateway's port and the rest to the page's. When the
+`magpie web` prints for its own page too. One location is enough: the
+page's port (`127.0.0.1:3430`) answers the gateway's client routes as well
+(`/v1/…`, `/v1beta/…`, `/mcp/…`, `/backend-api/codex/…` and the same
+routes without `/v1`), handing them to the gateway, so a proxy that sends
+everything to the page's port serves the page at `https://magpie.example.com/`
+and the agents at `https://magpie.example.com/v1`. Those routes are judged
+there exactly as on the gateway's port (the allow list, a gateway key from
+another machine or through the proxy, the Origin and Host checks); the
+page's sign-in cookie is no gateway key, and the page and its `/api` still
+need the page's key. Ollama's `/api/*` and Claude Desktop's `/api/hello`
+are the page's own namespace on that port, so a client of those is given
+the gateway's own port. When the
 proxy and magpie run on the same machine, a request it forwards over
 loopback carries a forwarding header and needs a gateway key as one from
 the network does (see [Providers and the gateway](#providers-and-the-gateway)); a proxy that
@@ -1823,8 +1833,9 @@ from `/api/tags`, each one's tools, vision, thinking and window from
 `/api/show`, and chats on `/v1/chat/completions`. Ollama's own chat
 (`/api/chat`, `/api/generate`, so `ollama run`) isn't served. Copilot sends
 no key, so this works on this computer only; behind a reverse proxy with a
-single public URL, `/api` goes to `magpie web`'s page, so give the
-gateway's own port.
+single public URL, `/api` goes to `magpie web`'s page (which answers the
+gateway's `/v1` routes but not its `/api` ones), so give the gateway's own
+port.
 
 Requests pass straight through when the vendor speaks the agent's API and
 are translated otherwise, streaming, tool calls and reasoning included. The
@@ -2309,7 +2320,9 @@ The service serves only the gateway unless asked for the page:
 `magpie daemon install --web` (or `magpie daemon web on` once installed)
 runs `magpie serve --web`, which serves the gateway and `magpie web`'s
 page from one process, so the page shows the service's own gateway,
-providers and accounts. It listens on `127.0.0.1:3430`; `--lan` puts it on
+providers and accounts. It listens on `127.0.0.1:3430`, which answers the
+gateway's `/v1` routes too (see [Connecting anything else](#connecting-anything-else)), so one
+reverse-proxy location serves both; `--lan` puts it on
 `0.0.0.0:3430` and `--addr host:port` anywhere, with the same warning as
 `magpie web --lan`: anyone with the link can change your settings. Its key
 is made once and kept in the service file (as `MAGPIE_WEB_KEY`, readable by

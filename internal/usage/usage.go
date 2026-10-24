@@ -234,7 +234,9 @@ func Append(r Record) {
 	if r.Time.IsZero() {
 		r.Time = Clock()
 	}
-	observeLedger(r)
+	if !r.IsProbe() { // magpie's own test is no call to export
+		observeLedger(r)
+	}
 	b, err := json.Marshal(r)
 	if err != nil {
 		return
@@ -286,7 +288,7 @@ func Load(since time.Time) []Record {
 			break
 		} // an unfinished line is left for the next read
 		var r Record
-		if json.Unmarshal(b, &r) == nil && (since.IsZero() || !r.Time.Before(since)) {
+		if json.Unmarshal(b, &r) == nil && !r.IsProbe() && (since.IsZero() || !r.Time.Before(since)) {
 			out = append(out, r)
 		}
 	}
@@ -1127,7 +1129,7 @@ func LastSeen(agent string) time.Time {
 	sc.Buffer(make([]byte, 64<<10), 1<<20)
 	for sc.Scan() {
 		var r Record
-		if json.Unmarshal(sc.Bytes(), &r) == nil && r.Agent == agent && r.Via == "" && r.Time.After(last) {
+		if json.Unmarshal(sc.Bytes(), &r) == nil && r.Agent == agent && r.Via == "" && !r.IsProbe() && r.Time.After(last) {
 			last = r.Time
 		}
 	}
