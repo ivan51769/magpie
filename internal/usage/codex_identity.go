@@ -213,8 +213,9 @@ func codexChunkResponsePairs(gateways, locals []*rowChunk, duplicateLocal map[ro
 			p.gatewayOK = isCodexRow(row) && !row.IsRejected() && row.Source != SourceReported
 		}
 	}
+	lent := lentRows() // picks are looked up by a local's id, not keyed
 	for _, chunk := range locals {
-		open := rows.of(chunk)
+		open := lent.of(chunk)
 		for i := range open.Rows {
 			ref := rowRef{chunk, i}
 			if duplicateLocal[ref] {
@@ -248,7 +249,7 @@ func foldCodexRows(locals []*rowChunk) map[rowRef]bool {
 	seed := maphash.MakeSeed()
 	first := map[uint64]rowRef{}
 	again := map[uint64][]rowRef{}
-	var rows chunkRows
+	rows := lentRows() // an id is kept as its hash
 	for _, chunk := range locals {
 		open := rows.of(chunk)
 		for i := range open.Rows {

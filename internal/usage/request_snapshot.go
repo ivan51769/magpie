@@ -134,18 +134,23 @@ func (k keptStrings) of(s string) string {
 // unpackInto is unpack decoding the rows into rows when it is large enough:
 // every field of a row is written, so a reused slice needs no clearing.
 func (c *rowChunk) unpackInto(into []packedRow) *rowChunk {
-	return c.unpackReusing(into, nil, nil)
+	return c.unpackReusing(into, nil, nil, nil)
 }
 
 // unpackReusing is unpackInto decoding the strings' and shapes' slices into
 // strs and shapes too, when they are large enough: for a reader that lets
-// go of a chunk's rows before it opens the next (chunkRows).
-func (c *rowChunk) unpackReusing(into []packedRow, strs []string, shapes [][rowTexts]uint32) *rowChunk {
+// go of a chunk's rows before it opens the next (chunkRows). With lent, the
+// block is decoded into *lent and the strings are of it, not a copy: they
+// are good until *lent is decoded into again.
+func (c *rowChunk) unpackReusing(into []packedRow, strs []string, shapes [][rowTexts]uint32, lent *[]byte) *rowChunk {
 	if c == nil || len(c.Archive) == 0 {
 		return c
 	}
-	buf := rowDecodes.Get().(*[]byte)
-	defer rowDecodes.Put(buf)
+	buf := lent
+	if buf == nil {
+		buf = rowDecodes.Get().(*[]byte)
+		defer rowDecodes.Put(buf)
+	}
 	data, err := s2.Decode((*buf)[:cap(*buf)], c.Archive)
 	if err != nil {
 		return nil
@@ -192,7 +197,12 @@ func (c *rowChunk) unpackReusing(into []packedRow, strs []string, shapes [][rowT
 	if !valid {
 		return nil
 	}
-	text := string(section[:len(section)-len(data)])
+	var text string
+	if lent != nil {
+		text = unsafe.String(unsafe.SliceData(section), len(section)-len(data))
+	} else {
+		text = string(section[:len(section)-len(data)])
+	}
 	for i := range next.Strings {
 		var n, shift uint64
 		for k := 0; ; k++ {

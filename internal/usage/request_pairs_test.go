@@ -2,6 +2,7 @@ package usage
 
 import (
 	"path/filepath"
+	"reflect"
 	"testing"
 	"time"
 
@@ -40,5 +41,41 @@ func TestRequestPairsReusedAcrossPages(t *testing.T) {
 		}
 		equalPage(t, QueryPage(p, Filter{}, 0, 100), want)
 		equalPage(t, QueryPage(p, Filter{Query: "main-a"}, 0, 100), pageFromLedger(p, Filter{Query: "main-a"}, 0, 100, LedgerOf(p, Filter{Query: "main-a"})))
+	}
+}
+
+// Codex's effort over a period whose page was just built pairs no row
+// again: the warm-up's page of All paired every session file's calls, and
+// the effort read after it paired them all over (#3493). It is the effort
+// a pairing of its own gives.
+func TestCodexEffortReusesPagePairing(t *testing.T) {
+	pageHome(t)
+	now := holdClock(t, time.Date(2026, 9, 30, 12, 0, 0, 0, time.Local))
+	dir := filepath.Join(sessions.CodexDir(), "sessions", "2026", "09", "30")
+	writeCodexIdentity(t, "main-a", "native-main", "vscode")
+	writeCodexCall(t, filepath.Join(dir, "rollout-2026-09-30T10-00-00-main-a.jsonl"), "main-a", "native-main", `"vscode"`, "resp-paired", "m", "low", now.Add(-time.Minute), 60, 6)
+	writeCodexCall(t, filepath.Join(dir, "rollout-2026-09-30T10-00-01-solo-b.jsonl"), "solo-b", "native-solo", `"vscode"`, "resp-solo", "m", "high", now.Add(-2*time.Minute), 30, 3)
+	writeCodexCall(t, filepath.Join(dir, "rollout-2026-09-30T10-00-02-fork-c.jsonl"), "fork-c", "native-solo", `"vscode"`, "resp-solo", "m", "high", now.Add(-2*time.Minute), 30, 3)
+	Append(Record{Time: now.Add(-time.Minute), Agent: "codex", Provider: "openai", Model: "m", Input: 60, Output: 6, Status: 200, ResponseID: "resp-paired"})
+	pairings := 0
+	pairing = func() { pairings++ }
+	t.Cleanup(func() { pairing = nil })
+
+	QueryPage(All, Filter{}, 0, 50)
+	if pairings != 1 {
+		t.Fatalf("the page paired %d times, want 1", pairings)
+	}
+	got := CodexModelEffort(All)
+	if pairings != 1 {
+		t.Fatalf("the effort after the page paired again (%d pairings)", pairings)
+	}
+	if rows := got["main-a"]; len(rows) != 1 || rows[0].Input != 60 {
+		t.Fatalf("effort = %+v", got)
+	}
+	requestCache.Lock()
+	requestCache.pairs = nil
+	requestCache.Unlock()
+	if want := codexEffortOfIndex(readRequestState(now), All, now); pairings != 2 || !reflect.DeepEqual(got, want) {
+		t.Fatalf("effort through the page's pairing %+v, a pairing of its own %+v (%d pairings)", got, want, pairings)
 	}
 }

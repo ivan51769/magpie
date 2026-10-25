@@ -403,7 +403,17 @@ type chunkRows struct {
 	buf     []packedRow
 	strs    []string
 	shapes  [][rowTexts]uint32
+	// lent: the strings are of the decoded block, not a copy of them, and
+	// the next chunk is decoded over them. For a pass that keeps nothing of
+	// a row past the next chunk, and clones a string it keeps: the passes
+	// that pair a page's calls copied every chunk's strings five times,
+	// ~250 MB of a warm start's page (#3493).
+	lent    bool
+	decoded []byte
 }
+
+// lentRows is a chunkRows whose strings are lent (chunkRows.lent).
+func lentRows() chunkRows { return chunkRows{lent: true} }
 
 // of is c's rows to read. What the page set on c since (a Codex actor or
 // compaction, the identities) is read through c.
@@ -412,7 +422,11 @@ func (r *chunkRows) of(c *rowChunk) *rowChunk {
 		return c
 	}
 	if r.c != c {
-		open := c.unpackReusing(r.buf, r.strs, r.shapes)
+		var lent *[]byte
+		if r.lent {
+			lent = &r.decoded
+		}
+		open := c.unpackReusing(r.buf, r.strs, r.shapes, lent)
 		if open == nil { // never written so: pack wrote it in this process
 			open = &rowChunk{Source: c.Source, Computer: c.Computer}
 		}
@@ -716,14 +730,7 @@ func queryPage(p Period, f Filter, offset, limit int, readSource func(sessions.C
 			shared.parts = map[partKey]map[uint64]*chunkPart{}
 		}
 		shared.parts[pk] = cache.next
-		if shared.pairs == nil || len(shared.pairs) >= partSets && shared.pairs[p] == nil {
-			shared.pairs = map[Period]*pairMemo{}
-		}
-		if cache.pairsNext != nil {
-			shared.pairs[p] = cache.pairsNext
-		} else {
-			delete(shared.pairs, p)
-		}
+		shared.keepPairs(p, cache.pairsNext)
 	}
 	if len(shared.pages) >= 16 {
 		shared.pages = map[pageKey]RequestPage{}
@@ -748,15 +755,20 @@ func codexEffortOfIndex(st requestState, p Period, now time.Time) map[string][]s
 	shared.Lock()
 	shared.keepWhileAsked()
 	shared.adopt(st)
+	// the page of p just before, the warm-up's of All, paired these rows:
+	// a build after it paired every session file's calls again (#3493)
+	memo := shared.pairs[p]
 	idx := shared.private()
 	shared.Unlock()
 	b := readRequestBlocks(idx, st, p, now, sessions.ReadCallSource)
 	sums := effortSums{}
-	pairRows(p, now, b.gateways, b.chunks, b.others, st.codexIdentities).visit(func(_ timedRef, r *Row) { sums.add(r) })
+	ps, next := pairRowsMemo(p, now, b.gateways, b.chunks, b.others, st.codexIdentities, memo)
+	ps.visit(func(_ timedRef, r *Row) { sums.add(r) })
 	b.priced.release()
 	shared.Lock()
 	if shared.keep(idx, b.on) {
 		shared.noteBuilt(b)
+		shared.keepPairs(p, next)
 		shared.trim(requestCacheBytes)
 	}
 	shared.Unlock()
@@ -944,6 +956,18 @@ func readRequestBlocks(idx *requestIndex, st requestState, p Period, now time.Ti
 // adopt drops what idx keeps of a state other than st: every chunk when
 // what prices or names a call changed (meta), the pages when anything
 // did (key). idx is locked.
+// keepPairs keeps memo as p's last pairing (nil: there is none to keep).
+func (idx *requestIndex) keepPairs(p Period, memo *pairMemo) {
+	if idx.pairs == nil || len(idx.pairs) >= partSets && idx.pairs[p] == nil {
+		idx.pairs = map[Period]*pairMemo{}
+	}
+	if memo != nil {
+		idx.pairs[p] = memo
+	} else {
+		delete(idx.pairs, p)
+	}
+}
+
 func (idx *requestIndex) adopt(st requestState) {
 	if idx.root != st.root || idx.meta != st.meta {
 		idx.root, idx.meta = st.root, st.meta
@@ -1091,7 +1115,7 @@ func (idx *requestIndex) trim(bound int64) {
 func visibleLocal(chunks []*rowChunk) map[rowRef]bool {
 	duplicates := map[rowRef]bool{}
 	seen := map[string]bool{}
-	var rows chunkRows
+	rows := lentRows() // a kept message id is cloned
 	for _, c := range chunks {
 		open := rows.of(c)
 		for i := range open.Rows {
@@ -1183,7 +1207,7 @@ func matchedBlocks(gateways []*rowChunk, chunks []*rowChunk, skip map[rowRef]boo
 		}
 	}
 	byRequest := map[string][]timedRef{}
-	var rows chunkRows
+	rows := lentRows() // a kept request id is cloned; a key is looked up
 	for _, c := range chunks {
 		open := rows.of(c)
 		for i := range open.Rows {
@@ -1405,7 +1429,13 @@ type pairedRows struct {
 	since, until  time.Time
 }
 
+// pairing, in tests, is told each time pairRows pairs chunks' rows.
+var pairing func()
+
 func pairRows(p Period, now time.Time, gateways, chunks, others []*rowChunk, identities map[string]sessions.CodexIdentity) *pairedRows {
+	if pairing != nil {
+		pairing()
+	}
 	gateways, chunks, others = cloneCodexChunks(gateways), cloneCodexChunks(chunks), cloneCodexChunks(others)
 	duplicateSkip := foldCodexRows(chunks)
 	pairs, compactions := codexChunkResponsePairs(gateways, chunks, duplicateSkip)
