@@ -49,6 +49,7 @@
     <a class="toc-only" href="/docs/remote">Remote magpie</a>
     <a class="toc-only" href="/docs/docker">Docker</a>
     <a class="toc-only" href="/docs/privacy">Privacy</a>
+    <a class="toc-only" href="/docs/masking">Privacy masking</a>
     <a href="/docs/import">Add to magpie</a>
     <a href="/docs/integrate">Integrate</a>
     <a href="https://github.com/yetone/magpie-releases/releases">Releases</a>
@@ -197,6 +198,7 @@
       <li>Values are held in memory only; the record on disk keeps each value’s kind, length and first characters. If masking is on and can’t run, the request gets a 503 and nothing is sent.</li>
       <li>The model sees the placeholder, not the value. A value a task needs as it is (a team address, a test key) goes under <span class="ui">Never mask</span>.</li>
     </ul>
+    <p>How to turn it on, what each switch masks, an example and how to check it: <a href="/docs/masking">Privacy masking</a>.</p>
 
     <h2 id="why"><a class="anchor" href="#why">Why the count is on</a></h2>
     <p>magpie works with dozens of agents and providers, and is maintained by a small team. The daily count is how we know which of them people actually use, so they are kept working first. It is on in releases because counts from those who turn it on would be too few to tell that. In exchange it is kept small: a random id, built-in ids, numbers; one switch or <code>DO_NOT_TRACK=1</code> turns it off, builds from source never send it, and this page lists everything that goes.</p>
@@ -213,6 +215,7 @@
     <a href="/docs/remote">Remote magpie</a>
     <a href="/docs/docker">Docker</a>
     <a href="/docs/privacy">Privacy</a>
+    <a href="/docs/masking">Privacy masking</a>
     <a href="/docs/import">Add to magpie</a>
     <a href="/docs/integrate">Integrate</a>
     <a href="https://github.com/yetone/magpie">GitHub</a>

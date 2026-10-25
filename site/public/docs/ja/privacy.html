@@ -49,6 +49,7 @@
     <a class="toc-only" href="/docs/ja/remote">リモート magpie</a>
     <a class="toc-only" href="/docs/ja/docker">Docker</a>
     <a class="toc-only" href="/docs/ja/privacy">プライバシー</a>
+    <a class="toc-only" href="/docs/ja/masking">プライバシーマスキング</a>
     <a href="/docs/ja/import">magpie に追加</a>
     <a href="/docs/integrate">アプリ連携</a>
     <a href="https://github.com/yetone/magpie-releases/releases">リリース</a>
@@ -197,6 +198,7 @@
       <li>値はメモリにだけ置かれ、ディスク上の記録は種類、長さ、先頭の数文字だけ。マスクがオンなのに動かないときは、リクエストは 503 になり、何も送られません。</li>
       <li>モデルに見えるのはプレースホルダーで、値そのものではありません。そのまま使う必要のある値（チームのアドレス、テスト用のキー）は <span class="ui">マスクしない</span> に入れてください。</li>
     </ul>
+    <p>オンにする方法、各スイッチがマスクするもの、例、効いているかの確かめ方は <a href="/docs/ja/masking">プライバシーマスキング</a> へ。</p>
 
     <h2 id="why"><a class="anchor" href="#why">カウントが既定でオンの理由</a></h2>
     <p>magpie は何十ものエージェントとプロバイダーに対応し、少人数で保守しています。毎日のカウントは、実際に使われているものを知り、それを優先して動くように保つための手段です。リリース版で既定オンなのは、自分でオンにする人の数だけでは少なすぎて、それがわからないからです。その代わり、送るものは小さく保っています。ランダムな ID、組み込みの ID、数だけです。スイッチ 1 つか <code>DO_NOT_TRACK=1</code> でオフにでき、ソースからのビルドは送らず、送るものはすべてこのページに挙げています。</p>
@@ -213,6 +215,7 @@
     <a href="/docs/ja/remote">リモート magpie</a>
     <a href="/docs/ja/docker">Docker</a>
     <a href="/docs/ja/privacy">プライバシー</a>
+    <a href="/docs/ja/masking">プライバシーマスキング</a>
     <a href="/docs/ja/import">magpie に追加</a>
     <a href="/docs/integrate">アプリ連携</a>
     <a href="https://github.com/yetone/magpie">GitHub</a>

@@ -49,6 +49,7 @@
     <a class="toc-only" href="/docs/zh/remote">远程 magpie</a>
     <a class="toc-only" href="/docs/zh/docker">Docker</a>
     <a class="toc-only" href="/docs/zh/privacy">隐私</a>
+    <a class="toc-only" href="/docs/zh/masking">本地脱敏</a>
     <a href="/docs/zh/import">Add to magpie</a>
     <a href="/docs/zh/integrate">接入应用</a>
     <a href="https://github.com/yetone/magpie-releases/releases">版本发布</a>
@@ -197,6 +198,7 @@
       <li>原值只在内存里；磁盘上的记录只留每个值的类型、长度和开头几个字符。脱敏打开却运行不了时，请求返回 503，什么都不发。</li>
       <li>模型看到的是占位符，不是值本身。任务需要原样使用的值（团队邮箱、测试用的 key）可以加进 <span class="ui">从不脱敏</span>。</li>
     </ul>
+    <p>怎么打开、每个开关遮掉什么、例子以及怎么确认生效，见 <a href="/docs/zh/masking">本地脱敏</a>。</p>
 
     <h2 id="why"><a class="anchor" href="#why">为什么计数默认开启</a></h2>
     <p>magpie 支持几十个 agent 和供应商，维护的人不多。每日计数让我们知道大家实际在用哪些，好先保证它们能用。正式版默认开启，是因为只靠主动开启的人，数量太少，看不出这些。作为交换，它尽量少：一个随机 ID、内置 ID 和数字；一个开关或 <code>DO_NOT_TRACK=1</code> 就能关掉，源码构建从不发送，发送的全部内容都列在这一页。</p>
@@ -213,6 +215,7 @@
     <a href="/docs/zh/remote">远程 magpie</a>
     <a href="/docs/zh/docker">Docker</a>
     <a href="/docs/zh/privacy">隐私</a>
+    <a href="/docs/zh/masking">本地脱敏</a>
     <a href="/docs/zh/import">Add to magpie</a>
     <a href="/docs/zh/integrate">接入应用</a>
     <a href="https://github.com/yetone/magpie">GitHub</a>

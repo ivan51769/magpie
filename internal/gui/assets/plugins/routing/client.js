@@ -310,7 +310,33 @@ function routingPage(part) {
   let skew = 0; // the gateway's clock less this page's
   // now is the gateway's time — or, in a replay, the time it is replaying
   const now = () => rp ? rp.real : Date.now() + skew;
-  const at = (s) => new Date(s).getTime();
+  // the times the trace says, each read once: every route names each of
+  // its keys' rest and try times, and a provider of hundreds of keys
+  // (#3164) had the stage, the story and the lists parse ~1M of them a
+  // second, more than a third of the page's time
+  const atOf = new Map();
+  const at = (s) => {
+    if (typeof s !== "string") return new Date(s).getTime();
+    let v = atOf.get(s);
+    if (v === undefined) {
+      if (atOf.size > 50000) atOf.clear();
+      atOf.set(s, v = new Date(s).getTime());
+    }
+    return v;
+  };
+  // when each rest was lifted by hand, by the key it rests by (#1869), on
+  // the gateway's clock: here, or anywhere else the trace tells of
+  // (d.lifted: the provider's editor's Try now, a key's new value)
+  const liftedAt = new Map();
+  function noteLifted(m) {
+    for (const [k, v] of Object.entries(m || {})) if (at(v) > (liftedAt.get(k) || 0)) liftedAt.set(k, at(v));
+  }
+  // lifted: the rest by key, found at found, was lifted since — by the
+  // time shown, so a replay of a request before the lift shows its rest
+  const lifted = (key, found) => { const l = liftedAt.get(key) || 0; return !!key && l >= found && l <= now(); };
+  // sunkKey is what a row sank by, as its rest's key is (restKey): an
+  // account by its provider and user, a key by its own id
+  const sunkKey = (w) => w.kind === "account" && w.who ? w.provider + "@" + w.who.toLowerCase() : w.id;
   const known0 = (s) => s && !s.startsWith("0001-");
   function dur(ms) {
     const s = Math.max(1, Math.round(ms / 1000));
@@ -810,7 +836,7 @@ function routingPage(part) {
       case "rule": {
         // the group's rule, or that of a group in it, that moved it
         const x = r.nested?.findLast((n) => n.rule?.use && !n.rule.unready && !n.rule.held)?.rule || r.rule;
-        return t("{who} answered this conversation last, but a new turn begins and the group's rule {n} puts {use} first.", { who: last, n: x?.n, use: useName(r, x?.use) });
+        return t("{who} answered this conversation last, but a new turn begins and the group's rule {n} puts {use} first.", { who: last, n: x?.n, use: useName(r, x?.instead && !x.unready ? x.instead : x?.use) });
       }
     }
     return null;
@@ -825,11 +851,16 @@ function routingPage(part) {
     // the folder the agent said it works in, when a rule asks for one
     const dir = x.folder ? " " + t("The agent works in {folder}.", { folder: x.folder }) : "";
     if (x.use && !x.unready) {
+      // the rule's first had none to take it, and its next went first
+      const first = x.use;
+      if (x.instead) x.use = useName(r, x.instead);
       const held = t("Rule {n} ({when}) sent turn {turn} to {use} as it began; the turn stays with whoever took it then.", { n: x.n, when, turn: x.turn, use: x.use });
       if (x.compact) return lead ? t("The agent is compacting the conversation, so rule {n} sends the summary to {use}; the conversation stays on the model it was on.", { n: x.n, use: x.use }) + (x.small?.length ? " " + t("Passed over, as the conversation is longer than they take: {models}.", { models: x.small.map((id) => useName(r, id)).join(", ") }) : "") : null;
       if (x.held) return lead || affWhy(r, true) ? held : null;
       if (x.grown) return lead ? t("Within turn {turn} the conversation grew to about {tokens} tokens, more than the model it was on takes, so rule {n} ({when}) moves it to {use}.", { turn: x.turn, tokens: tokens(x.tokens), n: x.n, when, use: x.use }) : null;
       if (!lead) return null;
+      if (x.instead) return t("Rule {n} matches, but {use} has no account or key that can take this request, so {instead}, which the rule names after it, goes first.", { n: x.n, use: first, instead: x.use }) + dir;
+      if (x.more?.length) return t("Turn {turn} begins and rule {n} matches — {when} — so {use} goes first, then {more}, which the rule names after it; the later rules' and the group's others stay behind them.", { turn: x.turn, n: x.n, when, use: x.use, more: x.more.map((id) => useName(r, id)).join(", ") }) + dir;
       if (x.then?.length) return t("Turn {turn} begins and rule {n} matches — {when} — so {use} goes first; if it fails, {then}, which the rules after it that match too name, then the group's others.", { turn: x.turn, n: x.n, when, use: x.use, then: x.then.map((id) => useName(r, id)).join(", ") }) + dir;
       return t("Turn {turn} begins and rule {n} matches — {when} — so {use} goes first; the group's others stay behind it if it fails.", { turn: x.turn, n: x.n, when, use: x.use }) + dir;
     }
@@ -857,6 +888,11 @@ function routingPage(part) {
     });
     return out + "]".repeat(open.length);
   }
+  // rUses is the models a rule sends to, in order: its use, then its
+  // more; setUses writes them back, each once, the first as its use (a
+  // rule of one model has no more, as one saved before it)
+  const rUses = (r) => [r.use, ...(r.more || [])].filter(Boolean);
+  const setUses = (r, ids) => { const u = [...new Set(ids.filter(Boolean))]; r.use = u[0] || ""; if (u.length > 1) r.more = u.slice(1); else delete r.more; };
   // useName is what a rule sends to: a model, or a group in the group
   // a group magpie found goes by the id agents pick it by (auto/<model>), not its internal group/auto-…
   const useName = (r, id) => {
@@ -872,9 +908,10 @@ function routingPage(part) {
       const x = n.rule, g = n.name || n.group;
       if (!x) continue;
       const when = (x.when || []).map(condText).join(", ");
-      if (x.use && x.instead) out.push(t("In {group}, rule {n} matches, but {use} has no account or key that can take this request, so a later matching rule puts {instead} first.", { group: g, n: x.n, use: x.use, instead: x.instead }));
+      if (x.use && x.instead && !x.unready && !x.held) out.push(t("In {group}, rule {n} matches, but {use} has no account or key that can take this request, so {instead}, which the rule names after it, goes first there.", { group: g, n: x.n, use: x.use, instead: x.instead }));
+      else if (x.use && x.instead && x.unready) out.push(t("In {group}, rule {n} matches, but {use} has no account or key that can take this request, so a later matching rule puts {instead} first.", { group: g, n: x.n, use: x.use, instead: x.instead }));
       else if (x.use && x.unready) out.push(t("In {group}, rule {n} matches, but {use} has no account or key that can take this request, so {group}'s order stands.", { group: g, n: x.n, use: x.use }));
-      else if (x.use && x.held) out.push(t("In {group}, rule {n} ({when}) sent turn {turn} to {use} as it began; the turn stays with whoever took it then.", { group: g, n: x.n, when, turn: x.turn, use: x.use }));
+      else if (x.use && x.held) out.push(t("In {group}, rule {n} ({when}) sent turn {turn} to {use} as it began; the turn stays with whoever took it then.", { group: g, n: x.n, when, turn: x.turn, use: x.instead || x.use }));
       else if (x.use) out.push(t("In {group}, rule {n} matches — {when} — so {use} goes first there.", { group: g, n: x.n, when, use: x.use }));
       else if (!x.waits) out.push(t("In {group}, no rule matches.", { group: g }));
     }
@@ -922,14 +959,15 @@ function routingPage(part) {
     if ((m = /^agent (.+)$/.exec(c))) return m[1].split("|").map(agentName).join(" / ");
     if ((m = /^not folder (.+)$/.exec(c))) return t("not in {folders}", { folders: m[1].split("|").join(" / ") });
     if ((m = /^folder (.+)$/.exec(c))) return t("in {folders}", { folders: m[1].split("|").join(" / ") });
-    if ((m = /^time (all day|(\d\d:\d\d)–(\d\d:\d\d))(?: (.+))?$/.exec(c))) {
-      // the days as the gateway writes them: Mon–Fri, Sat,Sun, Mon,Wed–Fri
+    if ((m = /^time (all day|(\d\d:\d\d)–(\d\d:\d\d))(?: ([^ (]+))?(?: \(([^)]+)\))?$/.exec(c))) {
+      // the days as the gateway writes them: Mon–Fri, Sat,Sun, Mon,Wed–Fri;
+      // the zone the hours are in after them, in brackets, when they have one
       const days = [];
       for (const part of (m[4] || "").split(",").filter(Boolean)) {
         const [a, b] = part.split("–").map((d) => WEEK.indexOf(d.toLowerCase()));
         for (let i = a; i >= 0 && i <= (b >= 0 ? b : a); i++) days.push(WEEK[i]);
       }
-      return timeText({ from: m[2] || "00:00", to: m[3] || "00:00", days });
+      return timeText({ from: m[2] || "00:00", to: m[3] || "00:00", days, zone: m[5] || "" });
     }
     return c;
   }
@@ -952,7 +990,37 @@ function routingPage(part) {
   function timeText(w) {
     const hours = w.from === w.to ? t("all day") : t("{from}–{to}", { from: w.from, to: w.to });
     const days = daysText(w.days);
-    return days ? t("{hours} {days}", { hours, days }) : hours;
+    const text = days ? t("{hours} {days}", { hours, days }) : hours;
+    const zone = zoneNote(w);
+    return zone ? t("{hours} ({zone})", { hours: text, zone }) : text;
+  }
+  // A rule's hours are in the zone they were set in (provider.TimeWindow
+  // Zone): the browser's, saved with them. magpie on a server in another
+  // zone (gaubeebangeel on X: a cloud box in UTC, its user in Beijing)
+  // reads them there, and the zone is told beside them; hours set before
+  // zones were kept are on the server's clock, told with its offset. When
+  // the clocks agree nothing is added.
+  const browserZone = () => { try { return Intl.DateTimeFormat().resolvedOptions().timeZone || ""; } catch { return ""; } };
+  // zoneOffset is how far zone is ahead of UTC now, in minutes; null when
+  // this browser doesn't know it
+  function zoneOffset(zone, at = new Date()) {
+    try {
+      const p = Object.fromEntries(new Intl.DateTimeFormat("en-US", { timeZone: zone, hourCycle: "h23", year: "numeric", month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit", second: "2-digit" })
+        .formatToParts(at).map((x) => [x.type, x.value]));
+      return Math.round((Date.UTC(+p.year, +p.month - 1, +p.day, +p.hour % 24, +p.minute, +p.second) - Math.floor(at.getTime() / 1000) * 1000) / 60000);
+    } catch { return null; }
+  }
+  const utcText = (min) => "UTC" + (min < 0 ? "−" : "+") + Math.floor(Math.abs(min) / 60) + (Math.abs(min) % 60 ? ":" + String(Math.abs(min) % 60).padStart(2, "0") : "");
+  function zoneNote(w) {
+    let clock;
+    try { clock = groups?.clock; } catch { return ""; } // before the groups are in
+    if (!clock || typeof clock.offset !== "number") return "";
+    const server = Math.round(clock.offset / 60);
+    if (w.zone) {
+      const off = zoneOffset(w.zone);
+      return off === server ? "" : t("{zone} time", { zone: w.zone });
+    }
+    return -new Date().getTimezoneOffset() === server ? "" : t("server time, {offset}", { offset: utcText(server) });
   }
   // "9:5" is no time; "9:05" is 09:05
   const clockOf = (s) => {
@@ -1357,21 +1425,45 @@ function routingPage(part) {
   }
   function show(c) { capLo = !!c.lo; cap.textContent = c.s; cap.classList.remove("in"); void cap.offsetWidth; cap.classList.add("in"); capAt = performance.now(); }
 
+  // curve is a wire's S from (x0, y0) to (x3, y3), its bends at mx: one
+  // cubic, cut into exact pieces of it about 1000 px tall (the middle ones
+  // up to 1.5 times that). WebKit dashes a cubic at a cost that grows faster
+  // than its length, and a key's fold hundreds of rows from magpie (#3164)
+  // had its flowing wire as one 18,000 px cubic: ~75 ms of each frame. The
+  // pieces trace the same curve.
+  function curve(x0, y0, mx, x3, y3) {
+    let a = [x0, y0], b = [mx, y0], c = [mx, y3];
+    const d = [x3, y3], lerp = (p, q, t) => [p[0] + (q[0] - p[0]) * t, p[1] + (q[1] - p[1]) * t];
+    let s = `M${x0} ${y0}`;
+    for (let n = Math.min(64, Math.ceil(Math.abs(y3 - y0) / 1000)); n > 1; n--) {
+      const t = 1 / n, ab = lerp(a, b, t), bc = lerp(b, c, t), cd = lerp(c, d, t), abc = lerp(ab, bc, t), bcd = lerp(bc, cd, t), m = lerp(abc, bcd, t);
+      s += ` C${ab[0]} ${ab[1]} ${abc[0]} ${abc[1]} ${m[0]} ${m[1]}`;
+      a = m; b = bcd; c = cd;
+    }
+    return s + ` C${b[0]} ${b[1]} ${c[0]} ${c[1]} ${x3} ${y3}`;
+  }
+
   function layout() {
     const r = stage.getBoundingClientRect();
     if (!r.width) return;
-    const b = (e) => { const x = e.getBoundingClientRect(); return { l: x.left - r.left, r: x.right - r.left, t: x.top - r.top, b: x.bottom - r.top, cx: (x.left + x.right) / 2 - r.left, cy: (x.top + x.bottom) / 2 - r.top }; };
-    wires.setAttribute("viewBox", `0 0 ${r.width} ${r.height}`);
-    sky.setAttribute("viewBox", `0 0 ${r.width} ${r.height}`);
+    // every box is read before any wire is drawn, each once: a wire drawn
+    // between two reads had the next read lay the stage out again, and
+    // hundreds of keys open (#3164) laid it out once a row, seconds a time
+    const boxes = new Map(), sets = [];
+    const b = (e) => {
+      let v = boxes.get(e);
+      if (!v) { const x = e.getBoundingClientRect(); boxes.set(e, v = { l: x.left - r.left, r: x.right - r.left, t: x.top - r.top, b: x.bottom - r.top, cx: (x.left + x.right) / 2 - r.left, cy: (x.top + x.bottom) / 2 - r.top }); }
+      return v;
+    };
     const h = b(hub), low = b(srcs).b;
     for (const a of agents.values()) {
       const s = b(a.node), mx = (s.r + h.l) / 2;
-      a.wire.setAttribute("d", h.l > s.r ? `M${s.r} ${s.cy} C${mx} ${s.cy} ${mx} ${h.cy} ${h.l} ${h.cy}` : `M${s.cx} ${s.b} L${h.cx} ${h.t}`);
+      sets.push([a.wire, h.l > s.r ? curve(s.r, s.cy, mx, h.l, h.cy) : `M${s.cx} ${s.b} L${h.cx} ${h.t}`]);
     }
     const fromHub = (a) => {
       if (a.l > h.r) {
         const mx = (h.r + a.l) / 2;
-        return `M${h.r} ${h.cy} C${mx} ${h.cy} ${mx} ${a.cy} ${a.l} ${a.cy}`;
+        return curve(h.r, h.cy, mx, a.l, a.cy);
       }
       // the accounts sit under magpie: a lane down their left, from below the agents too
       const x = a.l - 12, y = Math.max(h.b, low - 8);
@@ -1385,19 +1477,25 @@ function routingPage(part) {
     };
     for (const s of subs.values()) {
       const up = s.up && subs.get(s.up);
-      s.wire.setAttribute("d", up ? fromSub(up, b(s.li)) : fromHub(b(s.li)));
+      sets.push([s.wire, up ? fromSub(up, b(s.li)) : fromHub(b(s.li))]);
     }
     for (const f of folds.values()) {
-      if (!f.li.isConnected) { f.wire.removeAttribute("d"); continue; }
+      if (!f.li.isConnected) { sets.push([f.wire, null]); continue; }
       const up = f.up && subs.get(f.up);
-      f.wire.setAttribute("d", up ? fromSub(up, b(f.li)) : fromHub(b(f.li)));
+      sets.push([f.wire, up ? fromSub(up, b(f.li)) : fromHub(b(f.li))]);
     }
     for (const row of rows.values()) {
       // a key folded away has no wire: its fold's is the way to it
-      if (!row.li.isConnected) { row.wire.removeAttribute("d"); continue; }
+      if (!row.li.isConnected) { sets.push([row.wire, null]); continue; }
       const f = row.fold && folds.get(row.fold);
       const up = f?.open ? f : row.up && subs.get(row.up), a = b(row.li);
-      row.wire.setAttribute("d", up ? fromSub(up, a) : fromHub(a));
+      sets.push([row.wire, up ? fromSub(up, a) : fromHub(a)]);
+    }
+    wires.setAttribute("viewBox", `0 0 ${r.width} ${r.height}`);
+    sky.setAttribute("viewBox", `0 0 ${r.width} ${r.height}`);
+    for (const [p, d] of sets) {
+      if (d === null) { if (p.hasAttribute("d")) p.removeAttribute("d"); }
+      else if (p.getAttribute("d") !== d) p.setAttribute("d", d);
     }
     holdAll();
   }
@@ -1411,8 +1509,24 @@ function routingPage(part) {
     if (p?.account && w.kind === "account") {
       const user = (w.who || "").toLowerCase();
       i = loginsInOrder(p.account, p).findIndex((l) => (l.user || "").toLowerCase() === user);
-    } else if (p && w.kind === "key") i = (p.keyList || []).findIndex((k) => w.id === p.id + "#" + k.id);
+    } else if (p && w.kind === "key") i = keyRank(p, w.id);
     return i >= 0 ? i : (p ? 1000 : 0) + (w.rank || 0);
+  }
+  // keyRank is where a key is in its provider's list, by an index made
+  // once for the list: a sort of a route's hundreds of keys asked it for
+  // each comparison, and each looked through every key (#3164). An index
+  // the list has moved under (a drag reorders it in place) is made again.
+  const keyRanks = new WeakMap(); // keyList → { n, at: key id → place }
+  function keyRank(p, id) {
+    const ks = p.keyList || [], pre = p.id + "#";
+    if (!id.startsWith(pre)) return -1;
+    const kid = id.slice(pre.length);
+    let x = keyRanks.get(ks), i = x?.n === ks.length ? x.at.get(kid) : undefined;
+    if (!x || x.n !== ks.length || (i !== undefined && ks[i]?.id !== kid)) {
+      keyRanks.set(ks, x = { n: ks.length, at: new Map(ks.map((k, j) => [k.id, j])) });
+      i = x.at.get(kid);
+    }
+    return i ?? -1;
   }
 
   // seated: a route's accounts and keys each in a place of its own, not in
@@ -1435,13 +1549,14 @@ function routingPage(part) {
       if (m < 0) m = members.findIndex((x) => x.startsWith(w.provider + "/"));
       return [w.fallback ? 1 : 0, m < 0 ? members.length : m, w.name || w.provider, w.aside ? 1 : 0, rankOf(w), w.who || "", w.id];
     };
-    const cmp = (a, b) => {
-      const x = key(a), y = key(b);
+    const cmp = (x, y) => {
       for (let i = 0; i < x.length; i++) if (x[i] !== y[i]) return typeof x[i] === "number" ? x[i] - y[i] : String(x[i]).localeCompare(String(y[i]));
       return 0;
     };
     const on = new Set(r.order.map(seat));
-    return [...r.order, ...(r.left || []).filter((w) => heldOut(w) && !on.has(seat(w)))].sort(cmp);
+    // each one's key made once, not at each comparison (#3164)
+    return [...r.order, ...(r.left || []).filter((w) => heldOut(w) && !on.has(seat(w)))]
+      .map((w) => [key(w), w]).sort((a, b) => cmp(a[0], b[0])).map(([, w]) => w);
   }
 
   // a seat is one of a route's keys or accounts for one model: two of a
@@ -1458,7 +1573,13 @@ function routingPage(part) {
     || r.order.find((x) => x.id === tr.id);
   // tryseat is the seat of the row a try went to: its row is keyed by it
   const tryseat = (r, tr) => seat(tried(r, tr) || tr);
-  const setOf = (r) => r.order.map(seat).sort().join("\n");
+  // made once for each route's list, which a trace update replaces whole
+  const setsOf = new WeakMap();
+  const setOf = (r) => {
+    let s = setsOf.get(r.order);
+    if (s === undefined) setsOf.set(r.order, s = r.order.map(seat).sort().join("\n"));
+    return s;
+  };
   // whole fills in the lists a route's JSON can leave null: a route the
   // gateway weighed no seats for has "order": null, and the page reads
   // r.order, r.tries and r.left as lists everywhere — one null threw in
@@ -1698,16 +1819,17 @@ function routingPage(part) {
     const latest = new Map();
     for (const r of rs) latest.set(setOf(r), r);
     sets = [...sets.filter((k) => latest.has(k)), ...[...latest.keys()].filter((k) => !sets.includes(k))];
-    const ids = [], wOf = new Map(), rOf = new Map();
+    // a Set beside the list: hundreds of keys looked each other up (#3164)
+    const ids = [], has = new Set(), wOf = new Map(), rOf = new Map();
     for (const k of sets) {
       const r = latest.get(k);
-      for (const w of seated(r)) if (!ids.includes(seat(w))) ids.push(seat(w));
+      for (const w of seated(r)) { const id = seat(w); if (!has.has(id)) { has.add(id); ids.push(id); } }
     }
     for (const r of rs) for (const w of [...r.order, ...(r.left || [])]) { wOf.set(seat(w), w); rOf.set(seat(w), r.id); }
     // where each was, of those on the stage: a key folded away was nowhere
     const before = new Map([...[...rows].map(([id, row]) => [id, row.li]), ...[...folds].map(([k, f]) => ["\u0001" + k, f.li])]
       .filter(([, li]) => li.isConnected).map(([id, li]) => [id, li.getBoundingClientRect().top]));
-    for (const [id, row] of rows) if (!ids.includes(id)) { row.li.remove(); row.wire.remove(); rows.delete(id); }
+    for (const [id, row] of rows) if (!has.has(id)) { row.li.remove(); row.wire.remove(); rows.delete(id); }
     if (list.querySelector(".idle")) list.replaceChildren();
     for (const id of ids) {
       let row = rows.get(id);
@@ -1750,7 +1872,8 @@ function routingPage(part) {
     for (const id of ids) {
       const row = rows.get(id), via = row.w.via || [], f = foldOf.get(id);
       row.fold = f ? f.key : null;
-      row.li.style.setProperty("--depth", via.length + (f ? 1 : 0));
+      const depth = String(via.length + (f ? 1 : 0));
+      if (row.li.style.getPropertyValue("--depth") !== depth) row.li.style.setProperty("--depth", depth);
       row.up = via.length ? via.join(">") : null;
       row.shut = null;
       for (let d = 0; d < via.length; d++) {
@@ -1787,13 +1910,15 @@ function routingPage(part) {
     // FLIP: from where each was to its new place
     let moved = false;
     const placed = [...[...rows].map(([id, row]) => [id, row.li]), ...[...folds].map(([k, f]) => ["\u0001" + k, f.li])].filter(([, li]) => li.isConnected);
-    for (const [id, li] of placed) {
-      const dy = before.has(id) ? before.get(id) - li.getBoundingClientRect().top : 0;
-      if (!dy || still()) continue;
+    // each row's place read before any is moved: a row moved between two
+    // reads laid the stage out again, once a row of hundreds (#3164)
+    const dys = still() ? [] : placed.map(([id, li]) => before.has(id) ? before.get(id) - li.getBoundingClientRect().top : 0);
+    placed.forEach(([, li], i) => {
+      if (!dys[i]) return;
       moved = true;
       li.style.transition = "none";
-      li.style.transform = `translateY(${dy}px)`;
-    }
+      li.style.transform = `translateY(${dys[i]}px)`;
+    });
     if (moved) {
       void list.offsetWidth;
       for (const [, li] of placed) { li.style.transition = ""; li.style.transform = ""; }
@@ -1885,15 +2010,22 @@ function routingPage(part) {
     for (const r of rs) for (const tr of r.tries) if (!tr.done) { trying.add(tryseat(r, tr)); busy.add(r.agent); }
     const onWire = new Set();
     for (const f of flying.values()) { onWire.add(f.id); busy.add(f.agent); }
-    for (const [id, row] of rows) {
-      // each row as the latest staged request that weighed it found it
-      // rests by key or account, and by key or account and model for a
-      // rest of one model only: the account's other models' rows don't
-      // rest with it (#1960)
-      const r = src().get(row.rid) || pinned || cur, answered = new Set(), rests = new Map(), gave = new Map(), went = new Map();
-      const restAt = (id, m, rest) => { const rm = restModel(rest, m); rests.set(rm ? id + "\u0000" + rm : id, rest); };
+    // what each request found, read once a pass: hundreds of a route's
+    // keys each read their route's whole list again (#3164)
+    const found = new Map();
+    const findings = (r) => {
+      let f = found.get(r);
+      if (f) return f;
+      const answered = new Set(), rests = new Map(), gave = new Map(), went = new Map();
+      // a rest lifted since it was found (#1869), here or in the
+      // provider's editor, is over: the row doesn't say it until the next
+      // request is refused again (zoecats on Discord)
+      const restAt = (id, m, rest, since) => {
+        if (lifted(rest.key, since)) return;
+        const rm = restModel(rest, m); rests.set(rm ? id + "\u0000" + rm : id, rest);
+      };
       const modelOf = (tr) => tried(r, tr)?.model || tr.model || "";
-      for (const w of r.order) if (w.rest) restAt(w.id, w.model, w.rest);
+      for (const w of r.order) if (w.rest) restAt(w.id, w.model, w.rest, at(r.time));
       for (const tr of r.tries) {
         if (tr.done && tryOk(tr)) answered.add(tryseat(r, tr));
         // the error the agent got: the last try's, once the request is
@@ -1902,10 +2034,19 @@ function routingPage(part) {
         // one the gateway went on from says what it answered, and that the
         // request went on, not that the agent got it
         else if (tr.done && !tr.rest && !tr.again && !tr.credits && tr !== r.tries[r.tries.length - 1]) went.set(tryseat(r, tr), tr);
-        if (tr.rest) restAt(tr.id, modelOf(tr), tr.rest);
+        if (tr.rest) restAt(tr.id, modelOf(tr), tr.rest, at(tr.start) + (tr.ms || 0));
       }
       // it answered: whatever rest it began in is over
       for (const tr of r.tries) if (tr.done && tryOk(tr)) { rests.delete(tr.id); rests.delete(tr.id + "\u0000" + modelOf(tr)); }
+      found.set(r, f = { answered, rests, gave, went });
+      return f;
+    };
+    for (const [id, row] of rows) {
+      // each row as the latest staged request that weighed it found it
+      // rests by key or account, and by key or account and model for a
+      // rest of one model only: the account's other models' rows don't
+      // rest with it (#1960)
+      const r = src().get(row.rid) || pinned || cur, { answered, rests, gave, went } = findings(r);
       const w = row.w, rest = rests.get(w.id) || rests.get(w.id + "\u0000" + (w.model || "")), resting = rest && at(rest.until) > n;
       let s;
       if (w.unlisted) s = unlistedWord(w);
@@ -1917,7 +2058,7 @@ function routingPage(part) {
       else if (gave.has(id)) s = t("{status} · {fail} · passed to {agent}", { status: gave.get(id).status, fail: failWord(gave.get(id).fail), agent: agentName(r.agent) });
       else if (went.has(id)) s = t("{status} · {fail} · went on to the next", { status: went.get(id).status, fail: failWord(went.get(id).fail) });
       else if (w.noURL) s = noURLWord(w);
-      else if (w.sunk) s = t("rate limited at {time} · at the back", { time: clock(w.sunk) });
+      else if (w.sunk && !lifted(sunkKey(w), at(w.sunk))) s = t("rate limited at {time} · at the back", { time: clock(w.sunk) });
       else if (w.known) {
         const soon = usedRenews(w);
         s = !w.routing && w.used >= 98 && w.credits ? quota(w, "{n} used · on credits", "{n} left · on credits")
@@ -2417,7 +2558,7 @@ function routingPage(part) {
       ? t("{agent} requested a subagent; magpie selects its model within this routing group.", { agent })
       : t("{agent} requested a subagent on {model}.", { agent, model: r.model });
     if (purposeOf(r.kind) === "kind:ambient_suggestions") return t("{agent} drafted the suggested prompts on its home page by itself, in the background, searching the project's files and connected apps, and checked them for safety. Not a turn of the conversation; Codex's Settings › Configuration › Suggested prompts turns it off.", { agent });
-    if (purposeOf(r.kind) === "kind:composer_predictions") return t("{agent} guessed your next message for its composer by itself, reading the whole conversation again. Not a turn of the conversation; Settings › General › Codex composer predictions picks its model, and Codex's Settings › General › Show predictions turns it off.", { agent });
+    if (purposeOf(r.kind) === "kind:composer_predictions") return t("{agent} guessed your next message for its composer by itself, reading the whole conversation again. Not a turn of the conversation; Codex composer predictions, under Settings in Codex's row on the Agents page, picks its model, and Codex's Settings › General › Show predictions turns it off.", { agent });
     if (r.kind === "luna_reserve") return t("{agent} sent this turn on Luna Reserve, which it turns to once the plan's own allowance is used up; it picks the model itself.", { agent });
     // the searcher asked first failed or found nothing, and this one
     // searched in its place: say which and why, not just who searched
@@ -2925,7 +3066,10 @@ function routingPage(part) {
   // place: the list scrolls on its own, and WebKit, a row taken out for a
   // moment, would send it back to its top from under the row just picked.
   // A list made mostly anew (another day) is put in at once, not row by
-  // row among the old ones.
+  // row among the old ones. A row going (one made again, its request having
+  // moved on) is taken out first: left where it was, every row after it was
+  // put in again in front of it, ~40 rows moved and laid out on each of the
+  // updates a busy gateway sends a second (#3164).
   function placeRows(els) {
     const kids = reqs.children;
     if (kids.length === els.length && els.every((e, i) => kids[i] === e)) return;
@@ -2935,6 +3079,8 @@ function routingPage(part) {
     for (const e of els) if (e.parentNode === reqs) kept++;
     if (kept * 2 < els.length) reqs.replaceChildren(...els);
     else {
+      const want = new Set(els);
+      for (const e of [...kids]) if (!want.has(e)) e.remove();
       let at = reqs.firstElementChild;
       for (const e of els) {
         if (e === at) { at = at.nextElementSibling; continue; }
@@ -3074,8 +3220,6 @@ function routingPage(part) {
       + (x.resetsAt ? " · " + resetInText(new Date(x.resetsAt)) : "")) : [];
   }
 
-  // when each rest was lifted by hand, by the key it rests by (#1869)
-  const liftedAt = new Map();
   // modelRest keeps the latest word of one of an account's models resting
   // alone (#1960)
   function modelRest(a, m, rest, when) {
@@ -3121,8 +3265,8 @@ function routingPage(part) {
     // a rest lifted by hand since the request that found it (#1869): the
     // kept requests still say it, until the next one asks it again
     for (const a of by.values()) {
-      if (a.rest?.key && (liftedAt.get(a.rest.key) || 0) >= a.restAt) a.rest = null;
-      for (const [m, x] of a.mrests) if (x.rest.key && (liftedAt.get(x.rest.key) || 0) >= x.at) a.mrests.delete(m);
+      if (a.rest && lifted(a.rest.key, a.restAt)) a.rest = null;
+      for (const [m, x] of a.mrests) if (lifted(x.rest.key, x.at)) a.mrests.delete(m);
     }
     const list = [...by.values()].sort((x, y) => (x.w.name || "").localeCompare(y.w.name || "") || x.w.provider.localeCompare(y.w.provider) || rankOf(x.w) - rankOf(y.w) || x.pos - y.pos);
     setText(actLabel, t("Accounts and keys"));
@@ -3137,6 +3281,10 @@ function routingPage(part) {
     const n = now();
     let prov = "";
     const out = [];
+    // each provider's keys and accounts, gathered once: each of hundreds
+    // of keys looked through the whole list for its own (#3164)
+    const kin = new Map(), kinOf = (w) => w.provider + "\u0000" + w.kind;
+    for (const a of list) { const k = kinOf(a.w); kin.has(k) ? kin.get(k).push(a) : kin.set(k, [a]); }
     for (const a of list) {
       const w = a.w;
       if (w.provider !== prov) {
@@ -3157,7 +3305,7 @@ function routingPage(part) {
       // up (#1319), opened to each in place; its accounts too, folded
       // when LONG or more
       if (folding(w)) {
-        const ks = list.filter((x) => x.w.provider === w.provider && x.w.kind === w.kind);
+        const ks = kin.get(kinOf(w));
         if (ks.length >= FOLD_AT) {
           const pk = w.provider + (w.kind === "account" ? "/@" : "/*"), open = isOpen(pk, w.kind === "account" && ks.length < LONG);
           if (ks[0] === a) out.push(keysRow(ks, pk, open, n, w.kind));
@@ -3230,7 +3378,7 @@ function routingPage(part) {
         if (rest.why !== "restricted" && rest.why !== "verify") go.title = t("Ends the rest: the next request asks it again. Refused again, it rests again.");
         go.onclick = async () => {
           try {
-            for (const x of lifts) { await api("gateway/unrest", { key: x.key }); liftedAt.set(x.key, Date.now()); }
+            for (const x of lifts) { await api("gateway/unrest", { key: x.key }); liftedAt.set(x.key, Date.now() + skew); }
             render();
           } catch (e) { go.textContent = e.message; }
         };
@@ -3813,6 +3961,7 @@ function routingPage(part) {
         const d = await res.json();
         heard = true;
         noteAccounts(d);
+        noteLifted(d.lifted);
         skew = at(d.now) - Date.now();
         mine = d.mine;
         // another magpie took the gateway over (#2606): its routes and seq
@@ -4190,7 +4339,7 @@ function routingPage(part) {
   // there, rather than leaving the slot empty.
   const openGroupEditor = async (g) => {
     if (groupDirty() && !(await confirmDiscard())) return false;
-    gEdit = { id: g.id, draft: { name: g.name, members: [...g.members], match: [...(g.match || [])], matched: [...(g.matched || [])], fast: [...(g.fast || [])], off: [...(g.off || [])], weights: { ...(g.weights || {}) }, routing: g.routing || "", pick: g.pick || "", affinity: g.affinity || "", sink: !!g.sink, unlists: !!g.unlists, firstToken: g.firstToken || 0, patience: patienceOf(g.patience), context: g.context || 0, classifier: g.classifier || "", effort: g.effort || "", levels: [...(g.levels || [])], rules: (g.rules || []).map((r) => ({ ...r, intent: r.intent || "", agents: [...(r.agents || [])], folders: [...(r.folders || [])], exceptFolders: [...(r.exceptFolders || [])], time: r.time ? { ...r.time, days: [...(r.time.days || [])] } : null })) } };
+    gEdit = { id: g.id, draft: { name: g.name, members: [...g.members], match: [...(g.match || [])], matched: [...(g.matched || [])], fast: [...(g.fast || [])], off: [...(g.off || [])], weights: { ...(g.weights || {}) }, routing: g.routing || "", pick: g.pick || "", affinity: g.affinity || "", sink: !!g.sink, unlists: !!g.unlists, firstToken: g.firstToken || 0, patience: patienceOf(g.patience), context: g.context || 0, classifier: g.classifier || "", effort: g.effort || "", levels: [...(g.levels || [])], rules: (g.rules || []).map((r) => ({ ...r, ...(r.more?.length ? { more: [...r.more] } : {}), intent: r.intent || "", agents: [...(r.agents || [])], folders: [...(r.folders || [])], exceptFolders: [...(r.exceptFolders || [])], time: r.time ? { ...r.time, days: [...(r.time.days || [])] } : null })) } };
     renderGroups();
     return true;
   };
@@ -4547,7 +4696,7 @@ function routingPage(part) {
     if (groupDirty() && !(await confirmDiscard())) return;
     const g = tp.group;
     gSel = null;
-    gEdit = { id: "", draft: { name: tplName(tp), slug: g.id, members: [...g.members], match: [], matched: [], fast: [], off: [], routing: g.routing || "", affinity: "", rules: (g.rules || []).map((r) => ({ ...r, intent: r.intent || "", agents: [...(r.agents || [])], folders: [], exceptFolders: [], time: null })), classifier: g.classifier || "", effort: "", levels: [] } };
+    gEdit = { id: "", draft: { name: tplName(tp), slug: g.id, members: [...g.members], match: [], matched: [], fast: [], off: [], routing: g.routing || "", affinity: "", rules: (g.rules || []).map((r) => ({ ...r, ...(r.more?.length ? { more: [...r.more] } : {}), intent: r.intent || "", agents: [...(r.agents || [])], folders: [], exceptFolders: [], time: null })), classifier: g.classifier || "", effort: "", levels: [] } };
     renderGroups();
     const ed = gList.querySelector(".rt-gedit");
     if (ed && window.scrollOnPurpose?.(ev)) ed.scrollIntoView({ block: "start", behavior: "smooth" });
@@ -4762,7 +4911,7 @@ function routingPage(part) {
     if (g.firstToken > 0 && !manual) tags.append(el("span", "tag", t("Next after {n} without a first token", { n: took(g.firstToken * 1000) })));
     if (g.rules?.length) {
       const r = el("span", "tag" + (manual ? " idle" : ""), t(g.rules.length === 1 ? "1 rule" : "{n} rules", { n: g.rules.length }));
-      r.title = (manual ? t("The rules wait while you pick the model by hand.") + "\n" : "") + g.rules.map((x, i) => `${i + 1}. ${ruleText(x)} → ${x.pause ? t("pause") + " " : ""}${memberLabel(g, x.use)}${x.useEffort ? " · " + t("{level} reasoning", { level: x.useEffort }) : ""}`).join("\n");
+      r.title = (manual ? t("The rules wait while you pick the model by hand.") + "\n" : "") + g.rules.map((x, i) => `${i + 1}. ${ruleText(x)} → ${x.pause ? t("pause") + " " : ""}${rUses(x).map((u) => memberLabel(g, u)).join(", ")}${x.useEffort ? " · " + t("{level} reasoning", { level: x.useEffort }) : ""}`).join("\n");
       tags.append(r);
     }
     if (g.disabled) tags.append(el("span", "tag idle", t("switched off")));
@@ -5175,7 +5324,7 @@ function routingPage(part) {
             if (d.members.includes(to)) { status(t("{name} at that reasoning is in the group already", { name: memberName(id) }), "err"); return; }
             d.members[i] = to;
             d.matched = d.matched.filter((x) => x !== id); // named now, at its own reasoning
-            for (const r of d.rules) if (r.use === id) r.use = to;
+            for (const r of d.rules) setUses(r, rUses(r).map((x) => x === id ? to : x));
             d.fast = d.fast.map((x) => x === id ? to : x);
             d.off = d.off.map((x) => x === id ? to : x);
             if (d.weights[id]) { d.weights[to] = d.weights[id]; delete d.weights[id]; }
@@ -5282,7 +5431,8 @@ function routingPage(part) {
       const named = d.members.filter((x) => !d.matched.includes(x));
       d.matched = matchedBy(d.match, named);
       d.members = [...named, ...d.matched];
-      d.rules = d.rules.filter((r) => d.members.includes(r.use));
+      // a rule keeps the models still here; it goes with its last
+      d.rules = d.rules.filter((r) => { setUses(r, rUses(r).filter((x) => d.members.includes(x))); return !!r.use; });
       d.fast = d.fast.filter((x) => d.members.includes(x));
       d.off = d.off.filter((x) => d.members.includes(x));
     }
@@ -5530,6 +5680,37 @@ function routingPage(part) {
       b.style.width = `clamp(6ch, ${w}px, 44ch)`;
       if (!b.isConnected) requestAnimationFrame(() => { if (b.isConnected) fitBox(b); });
     };
+    // moveRule puts the rule at `from` at `to` and keeps the keyboard on
+    // the same control of the moved rule (its handle, or its ⋯)
+    const moveRule = (from, to, keep) => {
+      if (to < 0 || to >= d.rules.length || to === from) return;
+      d.rules.splice(to, 0, d.rules.splice(from, 1)[0]);
+      drawRules();
+      if (keep) rlist.querySelectorAll(keep)[to]?.focus({ preventScroll: true });
+    };
+    // ruleHandle is a rule's number, which is also its handle (monkeyin_92
+    // on X): drag it to move the rule, or Alt+↑/↓ from the keyboard, as a
+    // model's number does; Move up and down stay under ⋯. The grip shows
+    // only on hover.
+    const ruleHandle = (i, row) => {
+      const b = el("button", "i ag-handle rt-rhandle", String(i + 1));
+      b.type = "button";
+      b.dataset.at = i;
+      b.setAttribute("aria-label", t("Move rule {n}", { n: i + 1 }));
+      b.title = t("Drag to reorder · Alt+↑/↓ to move");
+      b.onkeydown = (e) => {
+        if (!e.altKey || (e.key !== "ArrowUp" && e.key !== "ArrowDown")) return;
+        e.preventDefault();
+        e.stopPropagation();
+        moveRule(i, i + (e.key === "ArrowUp" ? -1 : 1), ".rt-rhandle");
+      };
+      b.onclick = (e) => { e.stopPropagation(); delete b.dataset.dragged; };
+      b.onpointerdown = (e) => {
+        const rows = [...rlist.children].filter((r) => r.classList.contains("rt-rule"));
+        dragRows(e, b, row, rlist, rows, (to) => moveRule(i, to));
+      };
+      return b;
+    };
     const drawRules = () => {
       drawCtx(); // the members' windows changed with them
       rlist.replaceChildren();
@@ -5692,15 +5873,19 @@ function routingPage(part) {
           wrap("exceptFolders", xf);
           if (mine === "exceptFolders") focus = () => xi.focus({ preventScroll: true });
         }
-        // hours of the day, on this computer's clock (a vendor's peak
+        // hours of the day, in the browser's time zone (a vendor's peak
         // hours, say): typed as 09:00 and 18:00, past midnight when the
         // second comes first; the days are picked like the agents, and
-        // days alone are all day
+        // days alone are all day. Hours changed here are in this browser's
+        // zone, saved with them; hours left alone keep theirs
         if (kinds.includes("time")) {
           const tm = el("span", "rt-cond tm");
           const tw = () => r.time || (r.time = { from: "", to: "", days: [] });
+          // a change to the hours or days: they are now in this browser's zone
+          const zoned = () => { const w = tw(), z = browserZone(); if (z) w.zone = z; return w; };
           const tFrom = input(r.time?.from || "", "09:00"), tTo = input(r.time?.to || "", "18:00");
-          tm.title = t("The turn begins within these hours, on this computer's clock — a provider's peak-price hours sent to another, say");
+          tm.title = t("The turn begins within these hours, in your time zone — a provider's peak-price hours sent to another, say");
+          const zoneTag = el("span", "rt-zone");
           tm.onclick = (e) => { if (e.target === tm || e.target.tagName === "SPAN") (tFrom.value ? tTo : tFrom).focus({ preventScroll: true }); };
           const dayBtn = el("button", "rt-cond");
           const drawTime = () => {
@@ -5710,13 +5895,17 @@ function routingPage(part) {
             tm.classList.toggle("bad", [[tFrom, w?.from], [tTo, w?.to]].some(([b, v]) => v && !clockOf(v) && document.activeElement !== b));
             dayBtn.textContent = daysText(w?.days) || t("every day");
             dayBtn.classList.toggle("on", !!daysText(w?.days));
+            // the zone the hours are in, when the server's clock is another
+            zoneTag.textContent = w && (w.from || w.to || w.days?.length) ? zoneNote(w) : "";
+            zoneTag.hidden = !zoneTag.textContent;
+            zoneTag.title = zoneTag.textContent;
           };
           for (const [box, key] of [[tFrom, "from"], [tTo, "to"]]) {
             box.className = "clock";
             box.maxLength = 5;
             box.inputMode = "numeric";
-            box.oninput = () => { tw()[key] = box.value.trim(); drawTime(); warn(); };
-            box.onblur = () => { const v = clockOf(box.value); if (v) { box.value = v; tw()[key] = v; } drawTime(); warn(); };
+            box.oninput = () => { zoned()[key] = box.value.trim(); drawTime(); warn(); };
+            box.onblur = () => { const v = clockOf(box.value); if (v) { box.value = v; if (tw()[key] !== v) zoned()[key] = v; } drawTime(); warn(); };
             box.onkeydown = (e) => e.stopPropagation();
           }
           tm.append(el("span", "", t("from")), tFrom, el("span", "", t("to")), tTo);
@@ -5725,14 +5914,14 @@ function routingPage(part) {
             ...presets.map(([v, label, ds]) => ({ value: "=" + v, label: t(label), note: ds.length ? daysText(ds) : t("not a condition") })),
             ...WEEK.map((d) => ({ value: d, label: t(DAY_NAMES[d]), note: r.time?.days?.includes(d) ? "✓" : "" })),
           ], (v) => {
-            const w = tw();
+            const w = zoned();
             if (v.startsWith("=")) w.days = [...presets.find(([id]) => "=" + id === v)[2]];
             else w.days = w.days.includes(v) ? w.days.filter((x) => x !== v) : WEEK.filter((x) => x === v || w.days.includes(x));
             if (w.days.length === 7) w.days = [];
             drawTime(); warn();
           });
           drawTime();
-          wrap("time", tm, dayBtn);
+          wrap("time", tm, dayBtn, zoneTag);
           if (mine === "time") focus = () => tFrom.focus({ preventScroll: true });
         }
         // the quiet + that adds a condition: what the rule doesn't show yet,
@@ -5756,22 +5945,61 @@ function routingPage(part) {
         then.append(el("span", "rt-arrow", "→"));
         then.lastChild.setAttribute("aria-hidden", "true");
         // the member it sends to
-        const ub = el("button", "rt-cond on rt-model");
-        const drawUse = () => { const note = memberNote(r.use); ub.replaceChildren(memberIcon(r.use), el("span", "", note ? `${memberName(r.use)} · ${note}` : r.use)); };
+        // the members it sends to, in order (monkeyin_92 on X: one rule,
+        // several models, not a rule each): the first goes first, the
+        // next when it fails or rests, then the later rules' and the
+        // group's others. A pause names one.
+        const ub = el("span", "rt-line rt-uses");
+        const drawUse = () => {
+          const uses = rUses(r);
+          ub.replaceChildren();
+          uses.forEach((u, k) => {
+            const b = el("button", "rt-cond on rt-model");
+            b.type = "button";
+            const note = memberNote(u);
+            b.append(memberIcon(u), el("span", "", note ? `${memberName(u)} · ${note}` : u));
+            // another of the group's in its place, none the rule names twice
+            b.onclick = (ev) => pickFrom("member", b, ev, d.members.filter((id) => id === u || !uses.includes(id)).map((id) => { const s = subOf(id); return { value: id, label: memberName(id), note: memberNote(id), icon: s ? undefined : modelOf(id)?.icon, icons: s ? groupIcons(s) : undefined }; }),
+              (v) => { const next = rUses(r); next[k] = v; setUses(r, next); drawUse(); warn(); }, u);
+            if (uses.length < 2) { ub.append(b); return; }
+            const w = el("span", "rt-c");
+            const x = el("button", "rt-cx");
+            x.type = "button";
+            x.title = t("Remove {name} from this rule", { name: memberName(u) });
+            x.setAttribute("aria-label", x.title);
+            x.append(svg(CROSS, 8, 2));
+            x.onclick = (e) => { e.stopPropagation(); setUses(r, uses.filter((_, j) => j !== k)); drawUse(); warn(); ub.querySelector(".rt-model")?.focus({ preventScroll: true }); };
+            w.append(b, x);
+            ub.append(w);
+          });
+          const left = d.members.filter((id) => !uses.includes(id));
+          if (r.pause || !left.length) return;
+          const add = el("button", "rt-adduse");
+          add.type = "button";
+          add.setAttribute("aria-haspopup", "menu");
+          add.title = t("Add a model it goes to next");
+          add.setAttribute("aria-label", add.title);
+          add.append(svg(PLUS, 11, 1.8));
+          add.onclick = (ev) => pickFrom("member", add, ev, left.map((id) => { const s = subOf(id); return { value: id, label: memberName(id), note: memberNote(id), icon: s ? undefined : modelOf(id)?.icon, icons: s ? groupIcons(s) : undefined }; }),
+            (v) => { setUses(r, [...rUses(r), v]); drawUse(); warn(); ub.querySelector(".rt-adduse")?.focus({ preventScroll: true }); });
+          ub.append(add);
+        };
         drawUse();
-        ub.onclick = (ev) => pickFrom("member", ub, ev, d.members.map((id) => { const s = subOf(id); return { value: id, label: memberName(id), note: memberNote(id), icon: s ? undefined : modelOf(id)?.icon, icons: s ? groupIcons(s) : undefined }; }),
-          (v) => { r.use = v; drawUse(); warn(); });
         const hint = el("span", "rt-rwarn");
         const need = el("div", "rt-rneed");
         const warn = () => {
           need.hidden = !(refused.has(r) && bareRule(r));
           need.textContent = need.hidden ? "" : t(r.pause ? "A pause needs hours, days, agents or folders. Add one with its +, or remove the rule from its ⋯ menu" : "This rule has no condition. Add one with its +, or remove the rule from its ⋯ menu");
-          const m = infoOf(r.use), bits = [];
+          const bits = [], uses = rUses(r);
           if (r.pause) bits.push(t("left out of the group then: not tried, not a fallback"));
-          if (!r.pause && r.images && m && m.ready && !m.images) bits.push(t("it doesn't take images"));
-          if (!r.pause && r.tokens && m?.context && m.context < r.tokens) bits.push(t("it takes {n} tokens", { n: m.context.toLocaleString(intlLang()) }));
-          // a summary longer than it takes goes by the next rule, or the group
-          if (!r.pause && r.compact && m?.context && d.members.some((id) => (infoOf(id)?.context || 0) > m.context)) bits.push(t("longer conversations skip it: it takes {n} tokens", { n: m.context.toLocaleString(intlLang()) }));
+          // each model the rule names, by name when it names more than one
+          for (const u of r.pause ? [] : uses) {
+            const m = infoOf(u), of = (s) => bits.push(uses.length > 1 ? `${memberName(u)}: ${s}` : s);
+            if (r.images && m && m.ready && !m.images) of(t("it doesn't take images"));
+            if (r.tokens && m?.context && m.context < r.tokens) of(t("it takes {n} tokens", { n: m.context.toLocaleString(intlLang()) }));
+            // a summary longer than it takes goes by the rule's next, the next rule, or the group
+            if (r.compact && m?.context && d.members.some((id) => (infoOf(id)?.context || 0) > m.context)) of(t("longer conversations skip it: it takes {n} tokens", { n: m.context.toLocaleString(intlLang()) }));
+          }
           const from = clockOf(r.time?.from), to = clockOf(r.time?.to);
           if (from && to && to < from) bits.push(t("runs past midnight, into the next day"));
           hint.textContent = bits.join(" · ");
@@ -5784,8 +6012,10 @@ function routingPage(part) {
         // from there or from the rule's menu.
         const setAct = (v) => {
           r.pause = v === "pause";
-          // what a pause doesn't take is cleared, not kept out of sight
+          // what a pause doesn't take is cleared, not kept out of sight;
+          // it pauses the rule's first model alone
           if (r.pause) {
+            delete r.more;
             Object.assign(r, { tokens: 0, images: false, effort: "", intent: "", compact: false, useEffort: "" });
             for (const [k, , p] of COND_KINDS) if (!p) openedOf(r).delete(k);
           }
@@ -5823,7 +6053,7 @@ function routingPage(part) {
         more.setAttribute("aria-label", t("Actions for rule {n}", { n: i + 1 }));
         more.title = t("Actions for rule {n}", { n: i + 1 });
         more.append(svg(DOTS, 14, 2.2));
-        const move = (to) => { d.rules.splice(to, 0, d.rules.splice(i, 1)[0]); drawRules(); rlist.querySelectorAll(".rt-rmore")[to]?.focus({ preventScroll: true }); };
+        const move = (to) => moveRule(i, to, ".rt-rmore");
         more.onclick = () => {
           const again = agentMenu?.anchor === more;
           closeAgentMenu();
@@ -5838,7 +6068,7 @@ function routingPage(part) {
             { name: "Remove rule", icon: CROSS, sep: true, run: () => { d.rules.splice(i, 1); drawRules(); } },
           ]);
         };
-        row.append(el("span", "i", String(i + 1)), line, then, more, need);
+        row.append(ruleHandle(i, row), line, then, more, need);
         rlist.append(row);
       });
       drawClassifier();
