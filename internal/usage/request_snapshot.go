@@ -131,6 +131,21 @@ func (k keptStrings) of(s string) string {
 	return kept
 }
 
+// decodeMapped is s2.Decode of src, of m's pages (readMapped). It is not
+// unpackReusing's own closure: data caught by one is on the heap, and
+// every read of a row's fields through it is slower.
+func decodeMapped(m *diskMapping, dst, src []byte) (data []byte, ok bool) {
+	var err error
+	if m == nil {
+		data, err = s2.Decode(dst, src)
+		return data, err == nil
+	}
+	if !readMapped(m, func() { data, err = s2.Decode(dst, src) }) {
+		return nil, false
+	}
+	return data, err == nil
+}
+
 // unpackInto is unpack decoding the rows into rows when it is large enough:
 // every field of a row is written, so a reused slice needs no clearing.
 func (c *rowChunk) unpackInto(into []packedRow) *rowChunk {
@@ -151,8 +166,8 @@ func (c *rowChunk) unpackReusing(into []packedRow, strs []string, shapes [][rowT
 		buf = rowDecodes.Get().(*[]byte)
 		defer rowDecodes.Put(buf)
 	}
-	data, err := s2.Decode((*buf)[:cap(*buf)], c.Archive)
-	if err != nil {
+	data, ok := decodeMapped(c.mapped, (*buf)[:cap(*buf)], c.Archive)
+	if !ok {
 		return nil
 	}
 	*buf = data
@@ -171,7 +186,7 @@ func (c *rowChunk) unpackReusing(into []packedRow, strs []string, shapes [][rowT
 		return nil
 	}
 	next := *c
-	next.Archive, next.Locations = nil, nil
+	next.Archive, next.Locations, next.mapped = nil, nil, nil
 	if uint64(cap(into)) >= rows {
 		next.Rows = into[:rows]
 	} else {

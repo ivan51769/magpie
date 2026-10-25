@@ -12,6 +12,8 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"runtime"
+	"runtime/debug"
 	"strings"
 	"sync"
 	"time"
@@ -133,7 +135,10 @@ func diskEntry(c *rowChunk) []byte {
 		b = appendDiskString(b, actor)
 	}
 	put(uint64(len(archive)))
-	return append(b, archive...)
+	if !readMapped(c.mapped, func() { b = append(b, archive...) }) {
+		return nil
+	}
+	return b
 }
 
 var errDiskEntry = errors.New("bad requests entry")
@@ -217,10 +222,61 @@ func readDiskEntry(b []byte) (*rowChunk, error) {
 	return c, nil
 }
 
+// diskMapping is the file mapped into memory, where the system can map
+// it: the chunks read from it are of its pages, not of the heap. Their
+// 41MB of a 421k-call history were a fifth of a warm magpie's heap, and
+// the collector let the heap grow by as much again before collecting
+// (#3493). It is unmapped once no chunk read from it is left.
+type diskMapping struct {
+	data []byte
+}
+
+// diskUnmapped, in tests, is told each time a mapping is let go of.
+var diskUnmapped func()
+
+// readMapped runs fn, which reads m's pages (none, with m nil). A fault
+// reading them, the file cut short under the mapping by another program,
+// is false and not a crash: magpie only ever renames a new file over it.
+func readMapped(m *diskMapping, fn func()) (ok bool) {
+	if m == nil {
+		fn()
+		return true
+	}
+	defer debug.SetPanicOnFault(debug.SetPanicOnFault(true))
+	defer func() {
+		if r := recover(); r != nil {
+			if _, fault := r.(runtime.Error); !fault {
+				panic(r)
+			}
+			ok = false
+		}
+	}()
+	fn()
+	runtime.KeepAlive(m)
+	return true
+}
+
 // readDiskEntries hands each entry of the file at path to each in turn,
 // while the file is of binary, root and meta. raw is the entry's bytes,
-// whole, to be written on as they are.
-func readDiskEntries(path, binary, root, meta string, each func(raw []byte) bool) {
+// whole, to be written on as they are; with m, they are of m's pages,
+// read-only, and good while m is.
+func readDiskEntries(path, binary, root, meta string, each func(raw []byte, m *diskMapping) bool) {
+	if m, ok := mapDiskFile(path); ok {
+		readMapped(m, func() {
+			header, b, ok := cutDiskEntry(m.data)
+			if !ok || string(header) != string(diskHeader(binary, root, meta)) {
+				return
+			}
+			for {
+				var raw []byte
+				if raw, b, ok = cutDiskEntry(b); !ok || !each(raw, m) {
+					return
+				}
+			}
+		})
+		m.read()
+		return
+	}
 	in, err := os.Open(path)
 	if err != nil {
 		return
@@ -233,10 +289,26 @@ func readDiskEntries(path, binary, root, meta string, each func(raw []byte) bool
 	}
 	for {
 		raw, ok := nextDiskEntry(r)
-		if !ok || !each(raw) {
+		if !ok || !each(raw, nil) {
 			return
 		}
 	}
+}
+
+// cutDiskEntry is nextDiskEntry of b, and what follows it. The entry can't
+// be appended to in place: b may be a read-only mapping.
+func cutDiskEntry(b []byte) (entry, rest []byte, ok bool) {
+	n, k := binary.Uvarint(b)
+	if k <= 0 || n == 0 || n > 256<<20 || uint64(len(b)-k) < 4+n {
+		return nil, nil, false
+	}
+	sum := binary.LittleEndian.Uint32(b[k:])
+	end := k + 4 + int(n)
+	entry = b[k+4 : end : end]
+	if crc32.ChecksumIEEE(entry) != sum {
+		return nil, nil, false
+	}
+	return entry, b[end:], true
 }
 
 func nextDiskEntry(r *bufio.Reader) ([]byte, bool) {
@@ -269,11 +341,12 @@ func writeDiskEntry(w *bufio.Writer, b []byte) error {
 // fromDisk puts in idx the chunks the file holds of the sources in want,
 // each still the size and mtime it was. idx is a private copy (private).
 func (idx *requestIndex) fromDisk(want map[string]sessions.CallSource) {
-	readDiskEntries(requestDiskPath(), requestDiskBinary(), idx.root, idx.meta, func(raw []byte) bool {
+	readDiskEntries(requestDiskPath(), requestDiskBinary(), idx.root, idx.meta, func(raw []byte, m *diskMapping) bool {
 		c, err := readDiskEntry(raw)
 		if err != nil {
 			return false
 		}
+		c.mapped = m
 		s, ok := want[c.Source.Path]
 		if !ok || s.Size != c.Source.Size || !s.Modified.Equal(c.Source.Modified) {
 			return true
@@ -309,7 +382,7 @@ func toDisk(root, meta string, chunks map[string]*rowChunk, on map[string]bool) 
 		}
 	}
 	if err == nil {
-		readDiskEntries(path, binary, root, meta, func(raw []byte) bool {
+		readDiskEntries(path, binary, root, meta, func(raw []byte, _ *diskMapping) bool {
 			p, ok := diskEntryPath(raw)
 			if !ok {
 				return false

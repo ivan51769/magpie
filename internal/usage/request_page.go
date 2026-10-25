@@ -124,6 +124,8 @@ type rowChunk struct {
 	// serial names the chunk as made, for the cells a page keeps of it
 	// (chunkSerial)
 	serial uint64
+	// mapped is the file Archive was read from, when it is of its pages
+	mapped *diskMapping
 }
 
 // rowMsg is the Text of a row's Claude message id, after rowText's, and
