@@ -481,7 +481,7 @@ A searcher named in Settings gives way to no other provider. Its error goes
 back to the model, and `webSearch` then asks the search APIs, when any are
 set up. `namedFailed` keeps the last search it didn't make, cleared when it
 next searches. Settings › Web search shows that (`SearcherFailed`,
-`searchFailed`) at the start of the row's help, ahead of its ellipsis.
+`searchFailed`) at the start of the row's help, which wraps whole.
 Gearclickist on Discord picked Grok. Their grok-4.7 rows were about 1.3k
 tokens, the size of a request Grok ran no search for (one that searched
 took 6k-66k on our account). Every search then went on to Codex's

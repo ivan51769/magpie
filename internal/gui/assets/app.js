@@ -21657,7 +21657,7 @@ function renderSearcher(s, keep, box) {
   // the one named didn't search last time, and no other provider searched
   // in its place (Gearclickist on Discord: Grok picked answered without
   // searching, and Codex's pricier model searched instead, unasked). First,
-  // so the one-line help's ellipsis doesn't hide it.
+  // so it reads before the help.
   const failed = s.searchFailed;
   if (!off && v && !s.searchUnused && failed) {
     const why = failed.notSearched ? t("it answered without searching the web, so its account or plan may not offer web search") : failed.nothingFound ? t("its reply named no page it found") : failed.why || t("it failed");

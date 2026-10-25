@@ -3346,7 +3346,10 @@ img.nav-ic { border-radius: 3px; object-fit: contain; }
    one-line rows, which min-height centred (the owner, 10-22) */
 .row.pref, body.window .row.pref { min-height: 48px; padding: 12px 12px 12px 14px; gap: 14px; }
 .row.pref .who { flex: 1 1 auto; }
-.row.pref .sub { margin-top: 2px; color: var(--fg-2); }
+/* a setting's line under its name is read whole, wrapped beside the control
+   it explains: one line cut with an ellipsis hid what the setting does
+   (arculongus on Discord, 10-25) */
+.row.pref .sub { margin-top: 2px; color: var(--fg-2); white-space: normal; overflow-wrap: anywhere; }
 .row.pref.font-row { flex-wrap: wrap; gap: 8px 14px; }
 .font-row .who { flex-basis: 160px; }
 .font-row .font-note { white-space: normal; }
